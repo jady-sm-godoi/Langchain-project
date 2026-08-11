@@ -21,18 +21,20 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra o conceito central do LangChain: a **pipeline** (cadeia). Uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada — tudo conectado com o operador `|`.
+O projeto hoje demonstra dois conceitos centrais do LangChain:
 
-```
-entrada → prompt → modelo (Gemini) → parser → pós-processamento → saída
-```
+1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
+   ```
+   entrada → prompt → modelo (Gemini) → parser → pós-processamento → saída
+   ```
+2. **Agente com LangGraph** — um agente que usa **ferramentas** (busca web via Tavily) para responder, com grafo servido localmente pela CLI do LangGraph.
 
 ## Pré-requisitos
 
 - **Python 3.13** (versão gerenciada pelo arquivo `.python-version`)
 - **[uv](https://docs.astral.sh/uv/)** — gerenciador de dependências e ambientes (rápido, usa o `pyproject.toml`)
 - **Conta Google** com acesso ao **Gemini API** (para gerar a chave `GEMINI_API_KEY`)
-- (opcional) Chave do **Tavily** (`TAVILY_API_KEY`) — usada em funcionalidades futuras de busca
+- **Chave do Tavily** (`TAVILY_API_KEY`) — usada pela tool de busca web do agente. Gere em [tavily.com](https://tavily.com)
 
 ## Configuração do ambiente
 
@@ -55,7 +57,7 @@ entrada → prompt → modelo (Gemini) → parser → pós-processamento → sa�
    TAVILY_API_KEY=sua_chave_aqui
    ```
 
-   > A `GEMINI_API_KEY` é obrigatória para rodar a pipeline. Gere em [Google AI Studio](https://aistudio.google.com/apikey).
+   > A `GEMINI_API_KEY` é obrigatória para rodar a pipeline e o agente. Gere em [Google AI Studio](https://aistudio.google.com/apikey). A `TAVILY_API_KEY` é necessária para a busca web do agente.
 
 ## Como rodar
 
@@ -76,6 +78,25 @@ Saída esperada (resposta do Gemini em caixa alta, pois há um passo de pós-pro
 ```
 A INTELIGÊNCIA ARTIFICIAL (IA) É UM CAMPO DA TECNOLOGIA DEDICADO À CRIAÇÃO DE SISTEMAS E MÁQUINAS CAPAZES DE SIMULAR A CAPACIDADE HUMANA DE RACIOCINAR, APRENDER E TOMAR DECISÕES. ...
 ```
+
+### Rodando o agente
+
+O agente fica em `agent.py`. Exemplo de invocação:
+
+```python
+from agent import agente_jady
+
+resposta = agente_jady.invoke({"messages": [{"role": "user", "content": "Qual a temperatura média em São Paulo hoje?"}]})
+print(resposta["messages"][-1].text)
+```
+
+Para visualizar e depurar o grafo do agente na UI (LangGraph Studio):
+
+```bash
+langgraph dev
+```
+
+O servidor sobe em `http://localhost:2024`, lendo o `langgraph.json`.
 
 ## Conteúdo do curso
 
@@ -120,6 +141,34 @@ resultado = pipeline.invoke({"assunto": "o que é a inteligência artificial"})
 print(resultado)
 ```
 
+### Agente com LangGraph e busca Tavily
+
+Um **agente** vai além da pipeline fixa: ele decide, em loop, se usa **ferramentas** antes de responder. O `agent.py` cria um agente que consulta a web via Tavily quando precisa:
+
+```python
+from langchain.agents import create_agent
+from langchain_tavily import TavilySearch
+
+agente_jady = create_agent(
+    model=model,                                    # Gemini
+    system_prompt="Você é um assistente útil e prestativo...",
+    tools=[TavilySearch()],                         # tool de busca web
+)
+```
+
+Conceitos-chave:
+
+| Conceito | Papel |
+| --- | --- |
+| `create_agent` | Monta o agente: modelo + system prompt + ferramentas |
+| `TavilySearch` | Tool de busca na web; o agente a chama para buscar informações atuais |
+| `langgraph.json` | Configuração do grafo para a CLI — aponta `agent` para `./agent.py:agente_jady` e carrega o `.env` |
+| `langgraph dev` | Sobe o servidor de desenvolvimento com hot reload em `http://localhost:2024` |
+
+**Como o agente funciona:** o Gemini responde; se a pergunta exige informação externa, o modelo decide chamar a `TavilySearch`, recebe o resultado da busca e então monta a resposta final com base nesses dados.
+
+O agente também é exposto como grafo do LangGraph — é o que o `langgraph.json` faz ao declarar a variável `agente_jady` como entrada do grafo.
+
 ## Ferramentas extras — LangGraph Studio/CLI
 
 Para visualizar e depurar grafos de forma visual, o ecossistema LangChain oferece o **LangGraph Studio**, cujo backend local é gerenciado pela CLI oficial do LangGraph.
@@ -141,15 +190,18 @@ uv add "langgraph-cli[inmem]"
 
 ```
 Langchain-project/
-├── .env                # Chaves de API (NÃO versionado)
-├── .env.example        # Modelo das variáveis de ambiente
+├── .env                  # Chaves de API (NÃO versionado)
+├── .env.example          # Modelo das variáveis de ambiente
 ├── .gitignore
-├── .python-version     # Versão do Python (3.13)
-├── main.ipynb          # Notebook principal do curso
-├── main.py             # Entry point simples do projeto
-├── pyproject.toml      # Definição do projeto e dependências
+├── .langgraph_api/       # Artefatos de runtime do LangGraph (ignorado)
+├── .python-version       # Versão do Python (3.13)
+├── agent.py              # Agente com LangGraph (Gemini + Tavily)
+├── langgraph.json        # Configuração do grafo para a CLI
+├── main.ipynb            # Notebook principal do curso
+├── main.py               # Entry point simples do projeto
+├── pyproject.toml        # Definição do projeto e dependências
 ├── README.md
-└── uv.lock             # Lockfile de dependências (uv)
+└── uv.lock               # Lockfile de dependências (uv)
 ```
 
 ## Dependências
@@ -163,6 +215,8 @@ Definidas em `pyproject.toml`:
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
 | `langchain-openai` | Integração com modelos OpenAI (provedor alternativo) |
+| `langchain-tavily` | Tool de busca web (Tavily) usada pelo agente |
+| `langgraph-cli[inmem]` | CLI do LangGraph com runtime em memória (sem Docker) |
 | `dotenv` | Carrega variáveis de ambiente do arquivo `.env` |
 
 O projeto usa **uv** para gerenciar as dependências (`uv.lock` garante reprodutibilidade). Para adicionar novos pacotes:
@@ -177,8 +231,8 @@ uv add nome-do-pacote
 
 - [x] Setup do projeto com uv e variáveis de ambiente
 - [x] Primeira pipeline: `prompt | model | parser | RunnableLambda`
+- [x] Agente com LangGraph: `create_agent` + tool `TavilySearch`
 - [ ] Conversa com histórico (mensagens)
-- [ ] Ferramentas / agentes com LangGraph
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] RAG (recuperação de informação) com Tavily
 - [ ] TBD...
