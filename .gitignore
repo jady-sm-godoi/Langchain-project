@@ -13,6 +13,12 @@ wheels/
 # LangGraph runtime
 .langgraph_api/
 
+# Banco de dados da memória (runtime)
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
+*.sqlite
+
 # Jupyter
 .ipynb_checkpoints/
 

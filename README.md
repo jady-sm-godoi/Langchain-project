@@ -196,12 +196,14 @@ passando as duas mensagens juntas na invocação. No LangChain/LangGraph, isso �
 
 ### Implementando memória com checkpoints (LangGraph)
 
-Para dar "memória" ao agente, usamos o mecanismo de **checkpoint** do LangGraph. O `agent.py` foi atualizado com 3 peças:
+Para dar "memória" ao agente, usamos o mecanismo de **checkpoint** do LangGraph. Primeiro experimentamos o `InMemorySaver` (tudo em RAM) e depois evoluímos para **persistência em SQLite** — o `checkpoints.db`. O `agent.py` atual usa esta versão:
 
 ```python
-from langgraph.checkpoint.memory import InMemorySaver
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 
-checkpoint = InMemorySaver()   # 1. "memória" do agente (em memória)
+conn = sqlite3.connect("checkpoints.db", check_same_thread=False)  # 1. banco em arquivo
+checkpoint = SqliteSaver(conn)
 
 agente_jady = create_agent(
     model=model,
@@ -210,7 +212,7 @@ agente_jady = create_agent(
     checkpointer=checkpoint,   # 2. conecta a memória ao agente
 )
 
-config = {"configurable": {"thread_id": "1"}}  # 3. identifica a conversa
+config = {"configurable": {"thread_id": "novo_thread"}}  # 3. identifica a conversa
 
 resposta = agente_jady.invoke(
     {"messages": [{"role": "user", "content": pergunta}]},
@@ -220,7 +222,8 @@ resposta = agente_jady.invoke(
 
 | Peça | Papel |
 | --- | --- |
-| `InMemorySaver` | Checkpointer que guarda o **estado do grafo** (histórico de mensagens) em memória |
+| `sqlite3.connect("checkpoints.db")` | Abre a conexão com o **banco em disco** (arquivo `checkpoints.db`) |
+| `SqliteSaver(conn)` | Checkpointer que grava o **estado do grafo** (histórico de mensagens) no SQLite |
 | `checkpointer=` | Liga a memória ao agente: cada execução salva o estado |
 | `thread_id` | Identifica **uma conversa**; o estado é isolado por `thread_id` |
 | `config=config` | Informa na invocação qual conversa está em andamento |
@@ -234,11 +237,19 @@ Digite sua pergunta: Qual é meu nome mesmo?
 Resposta: Seu nome é Jadysse!
 ```
 
-**Como funciona:** na primeira pergunta, o histórico ("Olá, meu nome é Jadysse" + a resposta) é **salvo no checkpoint** da thread `1`. Na segunda pergunta, o agente **recupera esse histórico** e o reenvia ao modelo junto da nova mensagem — por isso o modelo agora sabe o nome.
+**Como funciona:** na primeira pergunta, o histórico ("Olá, meu nome é Jadysse" + a resposta) é **salvo no checkpoint** da thread `novo_thread`. Na segunda pergunta, o agente **recupera esse histórico** e o reenvia ao modelo junto da nova mensagem — por isso o modelo agora sabe o nome.
+
+**`InMemorySaver` vs `SqliteSaver`** (por que evoluímos):
+
+| | `InMemorySaver` | `SqliteSaver` |
+| --- | --- | --- |
+| Onde guarda | Memória RAM | Arquivo SQLite (`checkpoints.db`) |
+| Sobrevive a reiniciar o processo? | ❌ perde tudo | ✅ estado permanece |
+| Uso ideal | Testes rápidos/demos | Persistência real (aulas seguintes: `PostgresSaver`) |
 
 > **Atenção (didático):**
-> - O `thread_id` está **fixo** em `"1"` no código (`# TODO: id dinâmico`) — em produção, cada usuário/sessão teria um id próprio. Threads diferentes não compartilham memória.
-> - O `InMemorySaver` guarda tudo **em memória RAM**: o estado se perde ao reiniciar o processo. Para persistência entre execuções, usa-se um saver com banco de dados (ex.: `SqliteSaver`, `PostgresSaver`).
+> - O `thread_id` está **fixo** no código (`# TODO: id dinâmico`) — em produção, cada usuário/sessão teria um id próprio. Threads diferentes não compartilham memória.
+> - O arquivo `checkpoints.db*` é **dado de runtime** (não versionado — está no `.gitignore`).
 
 ## Ferramentas extras — LangGraph Studio/CLI
 
@@ -266,7 +277,8 @@ Langchain-project/
 ├── .gitignore
 ├── .langgraph_api/       # Artefatos de runtime do LangGraph (ignorado)
 ├── .python-version       # Versão do Python (3.13)
-├── agent.py              # Agente com LangGraph (Gemini + Tavily)
+├── agent.py              # Agente com LangGraph (Gemini + Tavily + memória SQLite)
+├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
 ├── langgraph.json        # Configuração do grafo para a CLI
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
@@ -286,8 +298,10 @@ Definidas em `pyproject.toml`:
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
 | `langchain-openai` | Integração com modelos OpenAI (provedor alternativo) |
-| `langchain-tavily` | Tool de busca web (Tavily) usada pelo agente |
+| `langgraph` | Framework de grafos/estados para agentes |
+| `langgraph-checkpoint-sqlite` | Checkpointer persistente em SQLite (fornece o `SqliteSaver`) |
 | `langgraph-cli[inmem]` | CLI do LangGraph com runtime em memória (sem Docker) |
+| `langchain-tavily` | Tool de busca web (Tavily) usada pelo agente |
 | `dotenv` | Carrega variáveis de ambiente do arquivo `.env` |
 
 O projeto usa **uv** para gerenciar as dependências (`uv.lock` garante reprodutibilidade). Para adicionar novos pacotes:
@@ -305,7 +319,7 @@ uv add nome-do-pacote
 - [x] Agente com LangGraph: `create_agent` + tool `TavilySearch`
 - [x] Demonstração: modelos são stateless (sem memória)
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
-- [ ] Persistência real da memória (banco de dados, ex.: `SqliteSaver`/`PostgresSaver`)
+- [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] RAG (recuperação de informação) com Tavily
 - [ ] TBD...
