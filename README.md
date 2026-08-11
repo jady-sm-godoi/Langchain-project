@@ -81,12 +81,16 @@ A INTELIGÊNCIA ARTIFICIAL (IA) É UM CAMPO DA TECNOLOGIA DEDICADO À CRIAÇÃO 
 
 ### Rodando o agente
 
-O agente fica em `agent.py`. Exemplo de invocação:
+O agente fica em `agent.py`. Exemplo de invocação (com memória por `thread_id`):
 
 ```python
 from agent import agente_jady
 
-resposta = agente_jady.invoke({"messages": [{"role": "user", "content": "Qual a temperatura média em São Paulo hoje?"}]})
+config = {"configurable": {"thread_id": "1"}}
+resposta = agente_jady.invoke(
+    {"messages": [{"role": "user", "content": "Qual a temperatura média em São Paulo hoje?"}]},
+    config=config,
+)
 print(resposta["messages"][-1].text)
 ```
 
@@ -169,6 +173,73 @@ Conceitos-chave:
 
 O agente também é exposto como grafo do LangGraph — é o que o `langgraph.json` faz ao declarar a variável `agente_jady` como entrada do grafo.
 
+### Modelos são stateless (sem memória)
+
+Demonstração feita rodando o `agent.py` em modo de conversa:
+
+```
+Digite sua pergunta: Meu nome é Jady
+Resposta: Prazer em conhecê-la, Jady! Como posso te ajudar hoje?
+Digite sua pergunta: Qual o meu nome?
+Resposta: Caralho, eu não sei! Você não me disse o seu nome ainda.
+```
+
+**Por que isso acontece:** cada `invoke` é uma chamada **independente** à API. O modelo não guarda estado entre requisições — ele apenas "enxerga" o que é enviado naquela chamada. Na segunda pergunta, o contexto (o nome) **não foi reenviado**, então o modelo não tem como saber.
+
+**Conceito:** LLMs são **stateless** (sem estado). A "memória" **não é intrínseca ao modelo** — é um **acessório** que precisamos implementar por fora. O padrão é reenviar o **histórico de mensagens** a cada chamada:
+
+```
+"Meu nome é Jady"  →  "Qual o meu nome?"
+```
+
+passando as duas mensagens juntas na invocação. No LangChain/LangGraph, isso é feito com o histórico em `messages` e mecanismos de estado/checkpoint — que é exatamente o que implementamos na seção seguinte.
+
+### Implementando memória com checkpoints (LangGraph)
+
+Para dar "memória" ao agente, usamos o mecanismo de **checkpoint** do LangGraph. O `agent.py` foi atualizado com 3 peças:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpoint = InMemorySaver()   # 1. "memória" do agente (em memória)
+
+agente_jady = create_agent(
+    model=model,
+    system_prompt="Você é um assistente útil e prestativo...",
+    tools=[TavilySearch()],
+    checkpointer=checkpoint,   # 2. conecta a memória ao agente
+)
+
+config = {"configurable": {"thread_id": "1"}}  # 3. identifica a conversa
+
+resposta = agente_jady.invoke(
+    {"messages": [{"role": "user", "content": pergunta}]},
+    config=config,
+)
+```
+
+| Peça | Papel |
+| --- | --- |
+| `InMemorySaver` | Checkpointer que guarda o **estado do grafo** (histórico de mensagens) em memória |
+| `checkpointer=` | Liga a memória ao agente: cada execução salva o estado |
+| `thread_id` | Identifica **uma conversa**; o estado é isolado por `thread_id` |
+| `config=config` | Informa na invocação qual conversa está em andamento |
+
+**A demonstração** (mesmo script de antes, agora com memória):
+
+```
+Digite sua pergunta: Olá, meu nome é Jadysse
+Resposta: Olá, Jadysse! É um prazer falar com você. Como posso te ajudar hoje?
+Digite sua pergunta: Qual é meu nome mesmo?
+Resposta: Seu nome é Jadysse!
+```
+
+**Como funciona:** na primeira pergunta, o histórico ("Olá, meu nome é Jadysse" + a resposta) é **salvo no checkpoint** da thread `1`. Na segunda pergunta, o agente **recupera esse histórico** e o reenvia ao modelo junto da nova mensagem — por isso o modelo agora sabe o nome.
+
+> **Atenção (didático):**
+> - O `thread_id` está **fixo** em `"1"` no código (`# TODO: id dinâmico`) — em produção, cada usuário/sessão teria um id próprio. Threads diferentes não compartilham memória.
+> - O `InMemorySaver` guarda tudo **em memória RAM**: o estado se perde ao reiniciar o processo. Para persistência entre execuções, usa-se um saver com banco de dados (ex.: `SqliteSaver`, `PostgresSaver`).
+
 ## Ferramentas extras — LangGraph Studio/CLI
 
 Para visualizar e depurar grafos de forma visual, o ecossistema LangChain oferece o **LangGraph Studio**, cujo backend local é gerenciado pela CLI oficial do LangGraph.
@@ -232,7 +303,9 @@ uv add nome-do-pacote
 - [x] Setup do projeto com uv e variáveis de ambiente
 - [x] Primeira pipeline: `prompt | model | parser | RunnableLambda`
 - [x] Agente com LangGraph: `create_agent` + tool `TavilySearch`
-- [ ] Conversa com histórico (mensagens)
+- [x] Demonstração: modelos são stateless (sem memória)
+- [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
+- [ ] Persistência real da memória (banco de dados, ex.: `SqliteSaver`/`PostgresSaver`)
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] RAG (recuperação de informação) com Tavily
 - [ ] TBD...

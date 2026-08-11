@@ -899,6 +899,7 @@ dependencies = [
     { name = "langchain-groq" },
     { name = "langchain-openai" },
     { name = "langchain-tavily" },
+    { name = "langgraph" },
     { name = "langgraph-cli", extra = ["inmem"] },
 ]
 
@@ -911,6 +912,7 @@ requires-dist = [
     { name = "langchain-groq", specifier = ">=1.1.3" },
     { name = "langchain-openai", specifier = ">=1.4.1" },
     { name = "langchain-tavily", specifier = ">=0.2.18" },
+    { name = "langgraph", specifier = ">=1.2.10" },
     { name = "langgraph-cli", extras = ["inmem"], specifier = ">=0.4.31" },
 ]
 

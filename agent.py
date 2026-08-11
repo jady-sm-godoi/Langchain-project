@@ -1,21 +1,30 @@
 from langchain.chat_models import init_chat_model
 from langchain.agents import create_agent
 from langchain_tavily import TavilySearch
+from langgraph.checkpoint.memory import InMemorySaver
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-model = init_chat_model(model="gemini-3.5-flash", model_provider="google_genai")
+checkpoint = InMemorySaver()
+
+model = init_chat_model(model="gemini-3.5-flash-lite", model_provider="google_genai")
 
 agente_jady = create_agent(
     model=model,
     system_prompt="Você é um assistente útil e prestativo. Responda de forma clara e concisa. Caso não saiba a resposta, solte um palavrão e diga que não sabe. Não invente respostas.",
     tools=[TavilySearch()],
+    checkpointer=checkpoint,
 )
 
-# pergunta_usuario = "Qual a temperatura média em São Paulo hoje?"
+config = {"configurable": {"thread_id": "1"}} #TODO: id dinâmico
 
-# resposta_agente = agente_jady.invoke({"messages": [{"role": "user", "content": pergunta_usuario}]})
+print("agente em funcionamento")
 
-# print(resposta_agente["messages"][-1].text)
+while True:
+    pergunta = input("Digite sua pergunta (ou 'sair' para encerrar): ")
+    if pergunta.lower() == "sair":
+        break
+    resposta = agente_jady.invoke({"messages": [{"role": "user", "content": pergunta}]}, config=config)
+    print("Resposta:", resposta["messages"][-1].text)
