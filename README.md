@@ -11,6 +11,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Configuração do ambiente](#configuração-do-ambiente)
 - [Como rodar](#como-rodar)
 - [Conteúdo do curso](#conteúdo-do-curso)
+- [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Dependências](#dependências)
@@ -251,6 +252,55 @@ Resposta: Seu nome é Jadysse!
 > - O `thread_id` está **fixo** no código (`# TODO: id dinâmico`) — em produção, cada usuário/sessão teria um id próprio. Threads diferentes não compartilham memória.
 > - O arquivo `checkpoints.db*` é **dado de runtime** (não versionado — está no `.gitignore`).
 
+### Gerenciando o contexto com SummarizationMiddleware
+
+A memória com checkpoints resolve o problema do *stateless*, mas cria outro: a cada `invoke`, **todo o histórico** da thread é reenviado ao modelo. Em conversas longas, o histórico cresce sem limite e **estoura a janela de contexto** (o limite de tokens que o modelo aceita por chamada).
+
+O `SummarizationMiddleware` resolve isso **condensando o histórico antigo**: em vez de reenviar mensagem por mensagem, ele gera um **resumo** das conversas passadas e reenvia só o que importa, mantendo o contexto essencial sem consumir a janela do modelo.
+
+**Configuração atual do `agent.py`:**
+
+```python
+from langchain.agents.middleware import SummarizationMiddleware
+
+agente_jady = create_agent(
+    model=model,
+    system_prompt="...",
+    tools=[TavilySearch()],
+    checkpointer=checkpoint,
+    middleware=[
+        SummarizationMiddleware(
+            model=model,
+            trigger=("tokens", 3000),   # quando a conversa passa de 3k tokens...
+            keep=("messages", 10),      # ...mantém as 10 últimas mensagens intactas
+        )
+    ],
+)
+```
+
+| Configuração | Papel |
+| --- | --- |
+| `middleware=[...]` | Lista de middlewares que interceptam a execução do agente (aqui, resumo de contexto) |
+| `trigger` | **Gatilho**: dispara a condensação quando o histórico atinge um limite — por contagem de mensagens (`("messages", N)`) ou por volume de tokens (`("tokens", N)`) |
+| `keep` | **Retenção**: quantas mensagens recentes permanecem intactas após a condensação |
+| `model=model` | Modelo usado para **gerar o resumo** (uma chamada extra, feita em segundo plano) |
+
+**Como funciona:** ao atingir o `trigger`, o middleware comprime as mensagens antigas num resumo, preserva as `keep` mais recentes e segue adiante. O resumo (estado `summary`) é persistido junto ao checkpoint, então a informação condensada não se perde entre execuções. A contrapartida: cada condensação gera **uma chamada adicional ao modelo**.
+
+#### Recomendações e Boas Práticas
+
+* **Aumentar o gatilho (`trigger`):** O ideal é dar margem para o agente acumular contexto útil antes de comprimi-lo. Dependendo do tamanho do modelo, valores como `("messages", 20)` ou baseados em tokens (ex: `("tokens", 3000)` a `("tokens", 4000)`) são muito mais comuns e eficientes.
+* **Aumentar a retenção (`keep`):** Recomenda-se manter pelo menos as últimas **10 a 20 mensagens** recentes intactas (`keep=("messages", 20)`), garantindo que o fluxo imediato da conversa e o uso recente de ferramentas não sejam perdidos na condensação.
+
+#### Exemplo de configuração mais equilibrada:
+```python
+SummarizationMiddleware(
+    model=model, 
+    trigger=("messages", 20), # ou ("tokens", 4000)
+    keep=("messages", 10)       # mantém um histórico recente saudável
+)
+```
+
 ## Ferramentas extras — LangGraph Studio/CLI
 
 Para visualizar e depurar grafos de forma visual, o ecossistema LangChain oferece o **LangGraph Studio**, cujo backend local é gerenciado pela CLI oficial do LangGraph.
@@ -320,6 +370,7 @@ uv add nome-do-pacote
 - [x] Demonstração: modelos são stateless (sem memória)
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
+- [x] Resumo de contexto: `SummarizationMiddleware` (`trigger` + `keep`)
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] RAG (recuperação de informação) com Tavily
 - [ ] TBD...
