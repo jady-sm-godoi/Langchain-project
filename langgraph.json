@@ -3,7 +3,7 @@
         "."
     ],
     "graphs": {
-        "agent": "./agent.py:agente_jady"
+        "agent": "./tool_busca_cep.py:agente_cep"
     },
     "env": ".env"
 }

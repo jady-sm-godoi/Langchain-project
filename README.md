@@ -11,6 +11,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Configuração do ambiente](#configuração-do-ambiente)
 - [Como rodar](#como-rodar)
 - [Conteúdo do curso](#conteúdo-do-curso)
+- [Criando ferramentas para agentes](#criando-ferramentas-para-agentes)
 - [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
@@ -22,13 +23,14 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra dois conceitos centrais do LangChain:
+O projeto hoje demonstra **três** conceitos centrais do LangChain:
 
 1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
    ```
    entrada → prompt → modelo (Gemini) → parser → pós-processamento → saída
    ```
 2. **Agente com LangGraph** — um agente que usa **ferramentas** (busca web via Tavily) para responder, com grafo servido localmente pela CLI do LangGraph.
+3. **Ferramentas para agentes** — a evolução da criação de ferramentas **próprias**: de uma tool simples (conversão de temperatura) até uma tool com **validação de entrada** e **tratamento de erros** (busca de CEP na ViaCEP).
 
 ## Pré-requisitos
 
@@ -103,6 +105,8 @@ langgraph dev
 
 O servidor sobe em `http://localhost:2024`, lendo o `langgraph.json`.
 
+> Hoje o `langgraph dev` carrega o agente da **Fase 2** de ferramentas (`./tool_busca_cep.py:agente_cep`). Para testar o agente da Fase 1, altere o `langgraph.json` para `./too_celsius_fahrenheit.py:agente_clima`.
+
 ## Conteúdo do curso
 
 Seção evolutiva: registra o que já foi estudado e servirá de índice para os próximos módulos.
@@ -173,6 +177,131 @@ Conceitos-chave:
 **Como o agente funciona:** o Gemini responde; se a pergunta exige informação externa, o modelo decide chamar a `TavilySearch`, recebe o resultado da busca e então monta a resposta final com base nesses dados.
 
 O agente também é exposto como grafo do LangGraph — é o que o `langgraph.json` faz ao declarar a variável `agente_jady` como entrada do grafo.
+
+### Criando ferramentas para agentes
+
+Um agente só é útil se tiver **ferramentas** (tools) para agir. O `agent.py` já usava a `TavilySearch` **pronta**; agora evoluímos para **criar nossas próprias ferramentas**. Esta seção documenta essa evolução em **duas fases**.
+
+#### Fase 1 — a tool simples (`too_celsius_fahrenheit.py`)
+
+A primeira ferramenta foi construída com o decorador `@tool`. Ela converte uma temperatura de Celsius para Fahrenheit:
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
+from langchain.tools import tool
+
+@tool
+def converter_temperatura(celsius: float) -> str:
+    """
+    Converte uma temperatura de Celsius para Fahrenheit.
+    Use quando o usuário perguntar sobre conversão de temperatura.
+
+    Args:
+        celsius (float): A temperatura em graus Celsius.
+
+    returns:
+        str: A temperatura convertida em Fahrenheit, formatada como uma string.
+    """
+    fahrenheit = (celsius * 9/5) + 32
+    return f"{fahrenheit:.2f} °F"
+
+agente_clima = create_agent(
+    model=model,
+    system_prompt="...",
+    tools=[converter_temperatura],
+)
+```
+
+**O contrato de uma tool boa:** para o modelo saber **quando** e **como** usar a ferramenta, ela precisa de um "contrato" claro:
+
+| Elemento | Papel |
+| --- | --- |
+| Nome da função | `converter_temperatura` — descreve a ação de forma concisa |
+| Doc-string | Explica o que a função faz, o uso indicado, os parâmetros e o retorno |
+| Type hints | `celsius: float -> str` — informa os tipos de entrada e saída |
+| Descrição | Frase curta indicando **quando usar** (o modelo lê isso para decidir) |
+
+**Responsabilidade única:** a tool faz **uma coisa só** — converter temperatura. Ferramentas genéricas confundem o modelo e ficam difíceis de testar.
+
+**Como o agente usa:** quando o usuário pergunta "quanto é 100°C em Fahrenheit?", o Gemini decide chamar `converter_temperatura(100)`, recebe `212.00 °F` e monta a resposta final com esse valor.
+
+#### Fase 2 — a tool com camadas de proteção (`tool_busca_cep.py`)
+
+A segunda ferramenta vai além: ela consulta uma **API externa** (ViaCEP) e adiciona **camadas de proteção** para o mundo real. Três novidades:
+
+**1. Validação de entrada com Pydantic (`args_schema`)**
+
+Um esquema Pydantic descreve os argumentos esperados e **valida** o que o modelo enviar **antes** de a função rodar:
+
+```python
+from pydantic import BaseModel, Field, field_validator
+
+class cep_input(BaseModel):  # classe para validação de entrada de dados com Pydantic
+    cep: str = Field(..., description="O CEP a ser consultado no padrão brasileiro com 8 dígitos.")
+
+    @field_validator("cep")
+    @classmethod
+    def validate_cep(cls, v: str) -> str:
+        cep_limpo = v.replace("-", "").strip()
+        if not cep_limpo.isdigit() or len(cep_limpo) != 8:
+            raise ValueError("CEP inválido. Deve conter apenas números e ter 8 dígitos.")
+        return cep_limpo
+
+@tool(args_schema=cep_input)  # o esquema de validação é passado à tool
+def busca_cep(cep: str) -> str:
+    """..."""
+    url = f"https://viacep.com.br/ws/{cep}/json/"
+    response = requests.get(url)
+    data = response.json()
+    return data
+```
+
+- `Field(..., description=...)` descreve o parâmetro para o modelo — enriquece o contrato da tool.
+- `field_validator("cep")` roda antes da execução: remove hífens/espaços e garante **8 dígitos numéricos**. Se inválido, lança `ValueError` e a tool **nem chega a chamar a API**.
+
+**2. Tratamento de erros com `@wrap_tool_call`**
+
+Erros (API fora do ar, CEP inexistente, falha de rede) não podem derrubar o agente. O middleware `wrap_tool_call` envolve a execução e devolve um `ToolMessage` amigável ao modelo:
+
+```python
+from langchain.agents.middleware import wrap_tool_call
+from langchain_core.messages import ToolMessage
+
+@wrap_tool_call
+async def tratar_erros(request, handler):
+    try:
+        return await handler(request)
+    except Exception as e:
+        tool_call_id = request.tool_call["id"]
+        return ToolMessage(
+            content=f"Erro ao executar ferramenta: {request.tool_call['name']}. Detalhes do erro: {str(e)}",
+            tool_call_id=tool_call_id,
+        )
+
+agente_cep = create_agent(
+    model=model,
+    system_prompt="...",
+    tools=[busca_cep],
+    middleware=[tratar_erros],   # intercepta falhas e devolve mensagem de erro
+)
+```
+
+**3. Chamada a uma API real**
+
+A tool usa `requests` para consultar a ViaCEP e devolve os dados do endereço.
+
+**Comparativo didático — Fase 1 × Fase 2:**
+
+| Aspecto | Fase 1 — `converter_temperatura` | Fase 2 — `busca_cep` |
+| --- | --- | --- |
+| Cálculo local | ✅ fórmula direta | ❌ consulta a uma API externa |
+| Validação de entrada | Não (entrada numérica simples) | ✅ Pydantic (`args_schema` + `field_validator`) |
+| Tratamento de erros | Implícito | ✅ middleware `@wrap_tool_call` |
+| Risco de falha | Baixo | Alto (rede, API, dados inexistentes) |
+| Complexidade | Mínima | Média |
+
+**A lição:** tools simples não precisam de muita proteção; tools que tocam o **mundo externo** (APIs, bancos, arquivos) **exigem** validação e tratamento de erros. É o que os comentários no fim do `tool_busca_cep.py` chamam de **camadas de proteção** — validação de entrada, tratamento de erros, logging, testes, monitoramento, segurança, entre outras.
 
 ### Modelos são stateless (sem memória)
 
@@ -329,11 +458,13 @@ Langchain-project/
 ├── .python-version       # Versão do Python (3.13)
 ├── agent.py              # Agente com LangGraph (Gemini + Tavily + memória SQLite)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
-├── langgraph.json        # Configuração do grafo para a CLI
+├── langgraph.json        # Configuração do grafo para a CLI (aponta para `tool_busca_cep.py:agente_cep`)
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
 ├── pyproject.toml        # Definição do projeto e dependências
 ├── README.md
+├── tool_busca_cep.py     # Fase 2: tool com validação Pydantic + tratamento de erros (agente_cep)
+├── too_celsius_fahrenheit.py  # Fase 1: tool simples de conversão de temperatura (agente_clima)
 └── uv.lock               # Lockfile de dependências (uv)
 ```
 
@@ -367,6 +498,8 @@ uv add nome-do-pacote
 - [x] Setup do projeto com uv e variáveis de ambiente
 - [x] Primeira pipeline: `prompt | model | parser | RunnableLambda`
 - [x] Agente com LangGraph: `create_agent` + tool `TavilySearch`
+- [x] Ferramentas para agentes — Fase 1: `@tool` simples (`converter_temperatura`)
+- [x] Ferramentas para agentes — Fase 2: validação Pydantic + tratamento de erros (`busca_cep`)
 - [x] Demonstração: modelos são stateless (sem memória)
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
