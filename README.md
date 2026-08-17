@@ -12,7 +12,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Como rodar](#como-rodar)
 - [Conteúdo do curso](#conteúdo-do-curso)
 - [Criando ferramentas para agentes](#criando-ferramentas-para-agentes)
-- [Agente com banco de dados (SQLDatabaseToolkit)](#agente-com-banco-de-dados-sqldatabasetoolkit)
+- [Agente com banco de dados (tools nativas)](#agente-com-banco-de-dados-tools-nativas)
 - [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
@@ -107,7 +107,7 @@ langgraph dev
 
 O servidor sobe em `http://localhost:2024`, lendo o `langgraph.json`.
 
-> Hoje o `langgraph dev` carrega o agente de banco de dados (`./agente_banco.py:agente_banco`). Para testar os outros agentes, altere o `langgraph.json` (ex.: `./tool_busca_cep.py:agente_cep` ou `./too_celsius_fahrenheit.py:agente_clima`).
+> Hoje o `langgraph dev` carrega o agente de banco de dados (`./agente_banco_v2.py:agente_banco`). Para testar os outros agentes, altere o `langgraph.json` (ex.: `./agente_banco.py:agente_banco`, `./tool_busca_cep.py:agente_cep` ou `./too_celsius_fahrenheit.py:agente_clima`).
 
 ## Conteúdo do curso
 
@@ -305,21 +305,16 @@ A tool usa `requests` para consultar a ViaCEP e devolve os dados do endereço.
 
 **A lição:** tools simples não precisam de muita proteção; tools que tocam o **mundo externo** (APIs, bancos, arquivos) **exigem** validação e tratamento de erros. É o que os comentários no fim do `tool_busca_cep.py` chamam de **camadas de proteção** — validação de entrada, tratamento de erros, logging, testes, monitoramento, segurança, entre outras.
 
-### Agente com banco de dados (SQLDatabaseToolkit)
+### Agente com banco de dados (tools nativas)
 
-Um agente pode ir além de ferramentas que chamam APIs e interagir diretamente com um **banco de dados relacional**. O `agente_banco.py` conecta o Gemini a um banco SQLite de uma loja fictícia (`loja.sqlite`) usando o `SQLDatabaseToolkit` do LangChain:
+Um agente pode ir além de ferramentas que chamam APIs e interagir diretamente com um **banco de dados relacional**. O projeto tem duas versões desse agente:
 
-```python
-from langchain_community.utilities import SQLDatabase
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
+- **`agente_banco.py` (v1, referência didática):** usa o `SQLDatabaseToolkit` do `langchain-community`, que monta automaticamente as 4 ferramentas SQL. Mantido para estudo/consulta.
+- **`agente_banco_v2.py` (v2, atual):** implementa as **mesmas 4 ferramentas manualmente** com `@tool` + `sqlite3`, sem depender do `langchain-community`.
 
-db = SQLDatabase.from_uri("sqlite:///loja.sqlite")   # conexão com o banco
+**Por que o v2 existe:** o pacote `langchain-community` foi **aposentado (sunset) em maio de 2026** — não recebe mais correções e seu repositório foi arquivado. Como não há pacote sucessor oficial para o `SQLDatabaseToolkit`, a orientação da própria LangChain é implementar as tools SQL diretamente no código da aplicação, usando o driver nativo do banco. É exatamente o que o v2 faz.
 
-toolkit = SQLDatabaseToolkit(db=db, llm=model)
-tools = toolkit.get_tools()                          # as 4 ferramentas do toolkit
-```
-
-**As quatro ferramentas do toolkit:**
+**As quatro ferramentas (idênticas em ambas as versões):**
 
 | Ferramenta | Papel |
 | --- | --- |
@@ -328,7 +323,41 @@ tools = toolkit.get_tools()                          # as 4 ferramentas do toolk
 | `sql_db_query` | Executa uma consulta SQL e retorna o resultado |
 | `sql_db_query_checker` | Valida a consulta e corrige erros comuns **antes** de executar |
 
-O agente é criado com `create_agent`, como nos módulos anteriores, recebendo essas ferramentas e um system prompt com regras de segurança:
+No v1, elas eram obtidas de uma linha só:
+
+```python
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+
+toolkit = SQLDatabaseToolkit(db=db, llm=model)
+tools = toolkit.get_tools()   # as 4 ferramentas prontas
+```
+
+No v2, cada uma vira uma função anotada com `@tool` que abre e fecha a conexão com `sqlite3` a cada chamada (padrão `try/finally`):
+
+```python
+import sqlite3
+from langchain.tools import tool
+
+@tool
+def sql_db_list_tables() -> str:
+    """Input is an empty string, output is a comma-separated list of tables in the database."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        return ", ".join(row[0] for row in cursor.fetchall() if not row[0].startswith("sqlite_"))
+    finally:
+        conn.close()
+```
+
+Detalhes da implementação do v2:
+
+- **`sql_db_schema`** consulta o `sqlite_master` para obter o `CREATE TABLE` e traz **3 linhas de amostra** de cada tabela (dá "exemplos" do formato dos dados ao modelo);
+- **`sql_db_query`** captura exceções e devolve o erro como string — o modelo **lê o erro, corrige a query e tenta de novo** (padrão de auto-correção);
+- **`sql_db_query_checker`** usa o próprio `model` para revisar a query gerada contra uma lista de erros comuns (NOT IN com NULL, UNION em vez de UNION ALL, BETWEEN exclusivo, tipos, joins...) e devolver a query corrigida;
+- nomes de tabelas são **validados contra a lista real do banco** e escapados com aspas antes de montar o SQL (evita injeção).
+
+O agente é criado com `create_agent`, como nos módulos anteriores:
 
 ```python
 agente_banco = create_agent(
@@ -507,9 +536,10 @@ Langchain-project/
 ├── .langgraph_api/       # Artefatos de runtime do LangGraph (ignorado)
 ├── .python-version       # Versão do Python (3.13)
 ├── agent.py              # Agente com LangGraph (Gemini + Tavily + memória SQLite)
-├── agente_banco.py       # Agente com SQLDatabaseToolkit (Gemini + banco SQLite da loja)
+├── agente_banco.py       # v1: agente de banco com SQLDatabaseToolkit (referência didática)
+├── agente_banco_v2.py    # v2: agente de banco com tools nativas (@tool + sqlite3, sem langchain-community)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
-├── langgraph.json        # Configuração do grafo para a CLI (aponta para `agente_banco.py:agente_banco`)
+├── langgraph.json        # Configuração do grafo para a CLI (aponta para `agente_banco_v2.py:agente_banco`)
 ├── loja.sqlite           # Banco da loja fictícia consultado pelo agente (runtime, ignorado)
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
@@ -528,7 +558,7 @@ Definidas em `pyproject.toml`:
 | --- | --- |
 | `langchain` | Framework principal para construir cadeias/aplicações com LLMs |
 | `langchain-core` | Núcleo: interfaces de prompts, modelos, parsers e `Runnable`s |
-| `langchain-community` | Integrações da comunidade: fornece o `SQLDatabase` e o `SQLDatabaseToolkit` (via SQLAlchemy) |
+| `langchain-community` | Integrações da comunidade. **Aposentado em maio/2026** — mantido no projeto apenas para o `agente_banco.py` (v1) de referência executar |
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
 | `langchain-openai` | Integração com modelos OpenAI (provedor alternativo) |
@@ -554,6 +584,7 @@ uv add nome-do-pacote
 - [x] Ferramentas para agentes — Fase 1: `@tool` simples (`converter_temperatura`)
 - [x] Ferramentas para agentes — Fase 2: validação Pydantic + tratamento de erros (`busca_cep`)
 - [x] Agente com banco de dados: `SQLDatabaseToolkit` (`agente_banco.py`)
+- [x] Migração pós-sunset: agente de banco com tools nativas (`agente_banco_v2.py`, sem `langchain-community`)
 - [x] Demonstração: modelos são stateless (sem memória)
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)

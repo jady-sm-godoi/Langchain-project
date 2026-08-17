@@ -3,7 +3,7 @@
         "."
     ],
     "graphs": {
-        "agent": "./agente_banco.py:agente_banco"
+        "agent": "./agente_banco_v2.py:agente_banco"
     },
     "env": ".env"
 }
