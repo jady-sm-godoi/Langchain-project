@@ -13,6 +13,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Conteúdo do curso](#conteúdo-do-curso)
 - [Criando ferramentas para agentes](#criando-ferramentas-para-agentes)
 - [Agente com banco de dados (tools nativas)](#agente-com-banco-de-dados-tools-nativas)
+- [RAG (Recuperação de Informação)](#rag-recuperação-de-informação)
 - [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
@@ -24,7 +25,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra **quatro** conceitos centrais do LangChain:
+O projeto hoje demonstra **cinco** conceitos centrais do LangChain:
 
 1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
    ```
@@ -33,6 +34,7 @@ O projeto hoje demonstra **quatro** conceitos centrais do LangChain:
 2. **Agente com LangGraph** — um agente que usa **ferramentas** (busca web via Tavily) para responder, com grafo servido localmente pela CLI do LangGraph.
 3. **Ferramentas para agentes** — a evolução da criação de ferramentas **próprias**: de uma tool simples (conversão de temperatura) até uma tool com **validação de entrada** e **tratamento de erros** (busca de CEP na ViaCEP).
 4. **Agente com banco de dados** — um agente que consulta um banco SQLite em linguagem natural usando o `SQLDatabaseToolkit`, com ferramentas que inspecionam o esquema, validam e executam consultas SQL.
+5. **RAG (recuperação de informação)** — o notebook `exemplo_rag.ipynb` vetoriza documentos com embeddings, guarda-os num vector store e recupera os trechos mais relevantes por **similaridade semântica** em resposta a uma pergunta.
 
 ## Pré-requisitos
 
@@ -40,6 +42,7 @@ O projeto hoje demonstra **quatro** conceitos centrais do LangChain:
 - **[uv](https://docs.astral.sh/uv/)** — gerenciador de dependências e ambientes (rápido, usa o `pyproject.toml`)
 - **Conta Google** com acesso ao **Gemini API** (para gerar a chave `GEMINI_API_KEY`)
 - **Chave do Tavily** (`TAVILY_API_KEY`) — usada pela tool de busca web do agente. Gere em [tavily.com](https://tavily.com)
+- **Chave da OpenAI** (`OPENAI_API_KEY`) — usada pelo notebook de RAG (`exemplo_rag.ipynb`) para gerar embeddings. Gere em [platform.openai.com](https://platform.openai.com)
 
 ## Configuração do ambiente
 
@@ -60,9 +63,10 @@ O projeto hoje demonstra **quatro** conceitos centrais do LangChain:
    ```
    GEMINI_API_KEY=suas_chave_aqui
    TAVILY_API_KEY=sua_chave_aqui
+   OPENAI_API_KEY=sua_chave_aqui
    ```
 
-   > A `GEMINI_API_KEY` é obrigatória para rodar a pipeline e o agente. Gere em [Google AI Studio](https://aistudio.google.com/apikey). A `TAVILY_API_KEY` é necessária para a busca web do agente.
+   > A `GEMINI_API_KEY` é obrigatória para rodar a pipeline e o agente. Gere em [Google AI Studio](https://aistudio.google.com/apikey). A `TAVILY_API_KEY` é necessária para a busca web do agente. A `OPENAI_API_KEY` é necessária para o notebook de RAG (`exemplo_rag.ipynb`), que gera embeddings com o modelo `text-embedding-3-large`.
 
 ## Como rodar
 
@@ -82,6 +86,14 @@ Saída esperada (resposta do Gemini em caixa alta, pois há um passo de pós-pro
 
 ```
 A INTELIGÊNCIA ARTIFICIAL (IA) É UM CAMPO DA TECNOLOGIA DEDICADO À CRIAÇÃO DE SISTEMAS E MÁQUINAS CAPAZES DE SIMULAR A CAPACIDADE HUMANA DE RACIOCINAR, APRENDER E TOMAR DECISÕES. ...
+```
+
+### Rodando o RAG
+
+O exemplo de RAG fica no notebook `exemplo_rag.ipynb`. Ele depende da `OPENAI_API_KEY` no `.env` — o notebook carrega as variáveis com `load_dotenv()`. Para abri-lo:
+
+```bash
+uv run jupyter notebook exemplo_rag.ipynb
 ```
 
 ### Rodando o agente
@@ -382,6 +394,54 @@ agente_banco = create_agent(
 
 > **Atenção (didático):** essa proteção vive no **prompt**. Em produção, o ideal é usar um **usuário do banco com permissão somente de leitura** — o prompt orienta o modelo, mas o banco é quem garante a segurança de verdade.
 
+### RAG (Recuperação de Informação)
+
+**RAG** (*Retrieval-Augmented Generation*) é o padrão de **recuperar documentos relevantes** antes de gerar uma resposta — o modelo responde com base no **seu próprio corpus** em vez de depender só do conhecimento pré-treinado. O notebook `exemplo_rag.ipynb` demonstra a parte de **recuperação** (retrieval) do fluxo: vetorizar, armazenar e buscar documentos por similaridade.
+
+O exemplo simula um **manual de RH** com 4 fatos da empresa (política de férias, ferramentas da engenharia, benefícios e expediente). O fluxo tem 3 etapas:
+
+```python
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# 1. Vetorização: transforma cada Document em um embedding (vetor numérico)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+# 2. Armazenamento: guarda os documentos vetorizados no vector store
+vectorstore = InMemoryVectorStore.from_documents(
+    documents=docs,
+    embedding=embeddings,
+)
+
+# 3. Recuperação: vira um retriever que devolve os k mais relevantes
+retriver = vectorstore.as_retriever(search_kwargs={"k": 2})
+```
+
+**Como funciona:**
+
+1. **Embeddings** — cada `Document` é convertido em um **vetor numérico** que captura o *significado* (semântica) do texto, não apenas as palavras exatas. O modelo usado é o `text-embedding-3-large` da OpenAI;
+2. **Vector store** — o `InMemoryVectorStore` guarda os vetores **em memória** (perde tudo ao reiniciar o kernel; ideal para testes didáticos). Em produção usa-se um banco vetorial persistente (Chroma, pgvector, Pinecone...);
+3. **Retriever** — o `as_retriever(search_kwargs={"k": 2})` cria um componente que recebe a pergunta, calcula o embedding dela e devolve os **2 documentos mais similares** ao corpus.
+
+**A demonstração do notebook** — para cada pergunta, o retriever devolve os 2 resultados mais relevantes:
+
+```
+PERGUNTA:  Quantos dias de férias eu tenho no ano?
+Resultado 1:  A politica de férias da empresa permite 30 dias por ano
+Resultado 2:  O expediente padrão é de segunda a sexta, das 9h as 18h
+
+PERGUNTA:  Quais os beneficios que a empresa oferece?
+Resultado 1:  Os benefícios incluiem plano de saude e vale alimentação
+Resultado 2:  A politica de férias da empresa permite 30 dias por ano
+```
+
+Observação: os "Resultado 2" nem sempre são perfeitos — a busca por **similaridade** pode trazer trechos só parcialmente relacionados. Em um RAG completo, esses resultados alimentariam um **prompt de geração** (LLM) que montaria a resposta final apenas com o contexto recuperado.
+
+> **Material de apoio:** o arquivo `RAG_explanation.md` compara a abordagem **modular do LangChain** (pipeline manual: loader → splitter → embeddings → vector store → retriever) com a **declarativa do Agno** (Knowledge Base acoplada ao agente), incluindo a diferença entre RAG simples e o RAG como **grafo do LangGraph** com correção/recuperação adaptativa.
+
 ### Modelos são stateless (sem memória)
 
 Demonstração feita rodando o `agent.py` em modo de conversa:
@@ -543,6 +603,8 @@ Langchain-project/
 ├── loja.sqlite           # Banco da loja fictícia consultado pelo agente (runtime, ignorado)
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
+├── exemplo_rag.ipynb     # Notebook de RAG: embeddings + vector store + retriever
+├── RAG_explanation.md    # Comparativo didático: RAG no LangChain vs. Agno
 ├── pyproject.toml        # Definição do projeto e dependências
 ├── README.md
 ├── tool_busca_cep.py     # Fase 2: tool com validação Pydantic + tratamento de erros (agente_cep)
@@ -561,7 +623,7 @@ Definidas em `pyproject.toml`:
 | `langchain-community` | Integrações da comunidade. **Aposentado em maio/2026** — mantido no projeto apenas para o `agente_banco.py` (v1) de referência executar |
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
-| `langchain-openai` | Integração com modelos OpenAI (provedor alternativo) |
+| `langchain-openai` | Integração com modelos OpenAI — usada pelo RAG para gerar embeddings (`text-embedding-3-large`) |
 | `langgraph` | Framework de grafos/estados para agentes |
 | `langgraph-checkpoint-sqlite` | Checkpointer persistente em SQLite (fornece o `SqliteSaver`) |
 | `langgraph-cli[inmem]` | CLI do LangGraph com runtime em memória (sem Docker) |
@@ -589,8 +651,9 @@ uv add nome-do-pacote
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
 - [x] Resumo de contexto: `SummarizationMiddleware` (`trigger` + `keep`)
+- [x] RAG: embeddings + `InMemoryVectorStore` + retriever (`exemplo_rag.ipynb`)
 - [ ] LangGraph Studio (visualização e depuração)
-- [ ] RAG (recuperação de informação) com Tavily
+- [ ] RAG completo com geração (LLM + contexto recuperado) e busca Tavily
 - [ ] TBD...
 
 ## Referências
