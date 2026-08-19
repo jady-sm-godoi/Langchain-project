@@ -25,7 +25,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra **cinco** conceitos centrais do LangChain:
+O projeto hoje demonstra **seis** conceitos centrais do LangChain:
 
 1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
    ```
@@ -35,6 +35,7 @@ O projeto hoje demonstra **cinco** conceitos centrais do LangChain:
 3. **Ferramentas para agentes** — a evolução da criação de ferramentas **próprias**: de uma tool simples (conversão de temperatura) até uma tool com **validação de entrada** e **tratamento de erros** (busca de CEP na ViaCEP).
 4. **Agente com banco de dados** — um agente que consulta um banco SQLite em linguagem natural usando o `SQLDatabaseToolkit`, com ferramentas que inspecionam o esquema, validam e executam consultas SQL.
 5. **RAG (recuperação de informação)** — o notebook `exemplo_rag.ipynb` vetoriza documentos com embeddings, guarda-os num vector store e recupera os trechos mais relevantes por **similaridade semântica** em resposta a uma pergunta.
+6. **RAG completo com PDF** — o notebook `rag_pdf.ipynb` leva o RAG até o fim: carrega um livro em PDF, divide em chunks, vetoriza com embeddings, persiste num **vector store Chroma** e **gera a resposta final com o Gemini** usando apenas o contexto recuperado.
 
 ## Pré-requisitos
 
@@ -95,6 +96,16 @@ O exemplo de RAG fica no notebook `exemplo_rag.ipynb`. Ele depende da `OPENAI_AP
 ```bash
 uv run jupyter notebook exemplo_rag.ipynb
 ```
+
+### Rodando o RAG completo com PDF
+
+O exemplo completo fica no notebook `rag_pdf.ipynb`. Ele carrega um livro de Flutter em PDF (`arquivos/Flutter_for_Beginners_by_Alessandro_Biessek_(z-lib.org).pdf`), divide em chunks, vetoriza com embeddings da OpenAI e persiste no Chroma (`chroma_db/`). Depende das chaves `OPENAI_API_KEY` (embeddings) e `GEMINI_API_KEY` (geração) no `.env`:
+
+```bash
+uv run jupyter notebook rag_pdf.ipynb
+```
+
+Na primeira execução, o vector store é criado e persistido em `chroma_db/`. Nas execuções seguintes, o notebook detecta o diretório e **carrega** a base já existente (sem re-embeddar). O PDF de entrada deve estar presente em `arquivos/` — ambos estão fora do controle de versão (`.gitignore`).
 
 ### Rodando o agente
 
@@ -440,7 +451,44 @@ Resultado 2:  A politica de férias da empresa permite 30 dias por ano
 
 Observação: os "Resultado 2" nem sempre são perfeitos — a busca por **similaridade** pode trazer trechos só parcialmente relacionados. Em um RAG completo, esses resultados alimentariam um **prompt de geração** (LLM) que montaria a resposta final apenas com o contexto recuperado.
 
-> **Material de apoio:** o arquivo `RAG_explanation.md` compara a abordagem **modular do LangChain** (pipeline manual: loader → splitter → embeddings → vector store → retriever) com a **declarativa do Agno** (Knowledge Base acoplada ao agente), incluindo a diferença entre RAG simples e o RAG como **grafo do LangGraph** com correção/recuperação adaptativa.
+> **Material de apoio:** o arquivo `explanations/RAG_Agno_versus_Langchain.md` compara a abordagem **modular do LangChain** (pipeline manual: loader → splitter → embeddings → vector store → retriever) com a **declarativa do Agno** (Knowledge Base acoplada ao agente), incluindo a diferença entre RAG simples e o RAG como **grafo do LangGraph** com correção/recuperação adaptativa. Já o `explanations/rag_langchain.md` explica a **teoria por trás** do `rag_pdf.ipynb` — o que cada método do RAG faz por baixo dos panos.
+
+### RAG completo com PDF (`rag_pdf.ipynb`)
+
+O primeiro exemplo mostrou só a **recuperação** (retrieval). O notebook `rag_pdf.ipynb` completa o ciclo de geração: recupera o contexto de um **PDF real** e usa o **Gemini** para montar a resposta final. O fluxo tem 4 etapas:
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain.chat_models import init_chat_model
+
+# 1. Carregamento: lê cada página do PDF como um Document (498 páginas)
+documents = PyPDFLoader("arquivos/Flutter_for_Beginners_by_Alessandro_Biessek_(z-lib.org).pdf").load()
+
+# 2. Divisão: quebra o texto em chunks de 1000 caracteres com overlap de 200 (972 chunks)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+docs = text_splitter.split_documents(documents)
+
+# 3. Persistência: embeddings OpenAI + vector store Chroma em disco (chroma_db/)
+vector_store = Chroma.from_documents(docs, embeddings, persist_directory="./chroma_db")
+retriver = vector_store.as_retriever(search_kwargs={"k": 2})
+
+# 4. Geração: o Gemini responde apenas com base no contexto recuperado
+resposta = llm.invoke(f"com base no seguinte contexto \n\n {contexto} \n\n responda a seguinte pergunta \n\n {pergunta}")
+```
+
+Novidades em relação ao `exemplo_rag.ipynb`:
+
+| Peça | Papel |
+| --- | --- |
+| `PyPDFLoader` | Carrega o PDF e transforma cada página em um `Document` |
+| `RecursiveCharacterTextSplitter` | Divide o texto em **chunks** (`chunk_size=1000`, `chunk_overlap=200`); o overlap preserva o contexto nas bordas entre chunks |
+| `Chroma` | Vector store **persistente em disco** (`chroma_db/`) — sobrevive ao reinício do kernel, ao contrário do `InMemoryVectorStore` |
+| Geração com LLM | O contexto recuperado alimenta o prompt; o Gemini responde com base nele (aqui as respostas são boas ao ponto de reconhecer quando a informação **não** está no livro) |
+
+**Como o notebook se comporta em execuções repetidas:** se `chroma_db/` já existe, ele apenas **carrega** a base com `Chroma(persist_directory=...)` — não re-embedda os 972 chunks de novo. O PDF de 24 MB em `arquivos/` e o vector store em `chroma_db/` ficam fora do controle de versão.
 
 ### Modelos são stateless (sem memória)
 
@@ -598,13 +646,18 @@ Langchain-project/
 ├── agent.py              # Agente com LangGraph (Gemini + Tavily + memória SQLite)
 ├── agente_banco.py       # v1: agente de banco com SQLDatabaseToolkit (referência didática)
 ├── agente_banco_v2.py    # v2: agente de banco com tools nativas (@tool + sqlite3, sem langchain-community)
+├── arquivos/             # Documentos de entrada do RAG (ex.: PDF do Flutter, ignorado)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
+├── chroma_db/            # Vector store persistente do RAG completo (runtime, ignorado)
 ├── langgraph.json        # Configuração do grafo para a CLI (aponta para `agente_banco_v2.py:agente_banco`)
 ├── loja.sqlite           # Banco da loja fictícia consultado pelo agente (runtime, ignorado)
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
 ├── exemplo_rag.ipynb     # Notebook de RAG: embeddings + vector store + retriever
-├── RAG_explanation.md    # Comparativo didático: RAG no LangChain vs. Agno
+├── rag_pdf.ipynb         # Notebook de RAG completo: PDF + Chroma + geração com Gemini
+├── explanations/         # Documentação teórica dos estudos
+│   ├── RAG_Agno_versus_Langchain.md  # Comparativo didático: RAG no LangChain vs. Agno
+│   └── rag_langchain.md             # Teoria por trás do rag_pdf.ipynb (RAG no LangChain)
 ├── pyproject.toml        # Definição do projeto e dependências
 ├── README.md
 ├── tool_busca_cep.py     # Fase 2: tool com validação Pydantic + tratamento de erros (agente_cep)
@@ -620,7 +673,8 @@ Definidas em `pyproject.toml`:
 | --- | --- |
 | `langchain` | Framework principal para construir cadeias/aplicações com LLMs |
 | `langchain-core` | Núcleo: interfaces de prompts, modelos, parsers e `Runnable`s |
-| `langchain-community` | Integrações da comunidade. **Aposentado em maio/2026** — mantido no projeto apenas para o `agente_banco.py` (v1) de referência executar |
+| `langchain-chroma` | Vector store persistente em disco, usado pelo RAG completo (`rag_pdf.ipynb`) |
+| `langchain-community` | Integrações da comunidade. **Aposentado em maio/2026** — mantido no projeto apenas para o `agente_banco.py` (v1) e o `PyPDFLoader` do `rag_pdf.ipynb` |
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
 | `langchain-openai` | Integração com modelos OpenAI — usada pelo RAG para gerar embeddings (`text-embedding-3-large`) |
@@ -628,6 +682,7 @@ Definidas em `pyproject.toml`:
 | `langgraph-checkpoint-sqlite` | Checkpointer persistente em SQLite (fornece o `SqliteSaver`) |
 | `langgraph-cli[inmem]` | CLI do LangGraph com runtime em memória (sem Docker) |
 | `langchain-tavily` | Tool de busca web (Tavily) usada pelo agente |
+| `pypdf` | Leitor de PDFs, usado pelo `PyPDFLoader` do RAG completo |
 | `dotenv` | Carrega variáveis de ambiente do arquivo `.env` |
 
 O projeto usa **uv** para gerenciar as dependências (`uv.lock` garante reprodutibilidade). Para adicionar novos pacotes:
@@ -652,8 +707,9 @@ uv add nome-do-pacote
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
 - [x] Resumo de contexto: `SummarizationMiddleware` (`trigger` + `keep`)
 - [x] RAG: embeddings + `InMemoryVectorStore` + retriever (`exemplo_rag.ipynb`)
+- [x] RAG completo com geração: PDF + Chroma persistente + resposta com Gemini (`rag_pdf.ipynb`)
+- [ ] RAG com busca web (Tavily) para complementar o contexto quando a base não responde
 - [ ] LangGraph Studio (visualização e depuração)
-- [ ] RAG completo com geração (LLM + contexto recuperado) e busca Tavily
 - [ ] TBD...
 
 ## Referências

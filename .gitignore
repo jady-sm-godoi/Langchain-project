@@ -19,6 +19,12 @@ checkpoints.db-shm
 checkpoints.db-wal
 *.sqlite
 
+# Vector store persistente do RAG (runtime)
+chroma_db/
+
+# Documentos de entrada do RAG (dados didáticos, fora do git)
+arquivos/
+
 # Jupyter
 .ipynb_checkpoints/
 
