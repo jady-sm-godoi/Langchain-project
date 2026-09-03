@@ -25,7 +25,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra **seis** conceitos centrais do LangChain:
+O projeto hoje demonstra **sete** conceitos centrais do LangChain:
 
 1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
    ```
@@ -36,6 +36,7 @@ O projeto hoje demonstra **seis** conceitos centrais do LangChain:
 4. **Agente com banco de dados** — um agente que consulta um banco SQLite em linguagem natural usando o `SQLDatabaseToolkit`, com ferramentas que inspecionam o esquema, validam e executam consultas SQL.
 5. **RAG (recuperação de informação)** — o notebook `exemplo_rag.ipynb` vetoriza documentos com embeddings, guarda-os num vector store e recupera os trechos mais relevantes por **similaridade semântica** em resposta a uma pergunta.
 6. **RAG completo com PDF** — o notebook `rag_pdf.ipynb` leva o RAG até o fim: carrega um livro em PDF, divide em chunks, vetoriza com embeddings, persiste num **vector store Chroma** e **gera a resposta final com o Gemini** usando apenas o contexto recuperado.
+7. **Agente RAG (`agente_rag.py`)** — unifica o RAG e o agente: o PDF é carregado, chunkado e vetorizado no Chroma, e a busca no documento vira uma **ferramenta do agente**. O modelo decide quando consultar o documento para responder perguntas sobre Flutter.
 
 ## Pré-requisitos
 
@@ -130,7 +131,32 @@ langgraph dev
 
 O servidor sobe em `http://localhost:2024`, lendo o `langgraph.json`.
 
-> Hoje o `langgraph dev` carrega o agente de banco de dados (`./agente_banco_v2.py:agente_banco`). Para testar os outros agentes, altere o `langgraph.json` (ex.: `./agente_banco.py:agente_banco`, `./tool_busca_cep.py:agente_cep` ou `./too_celsius_fahrenheit.py:agente_clima`).
+> Hoje o `langgraph dev` carrega o agente RAG (`./agente_rag.py:agent_rag`). Para testar os outros agentes, altere o `langgraph.json` (ex.: `./agente_banco_v2.py:agente_banco`, `./tool_busca_cep.py:agente_cep` ou `./too_celsius_fahrenheit.py:agente_clima`).
+
+### Rodando o agente RAG
+
+O agente RAG fica em `agente_rag.py`. Ele carrega o PDF do Flutter, chunkiza, vetoriza no Chroma e expõe a busca como ferramenta do agente:
+
+```python
+from agente_rag import agent_rag
+
+resposta = agent_rag.invoke(
+    {"messages": [{"role": "user", "content": "O que é Flutter?"}]},
+)
+print(resposta["messages"][-1].text)
+```
+
+Para expô-lo via LangGraph Studio, o `langgraph.json` já está configurado com:
+```json
+{
+    "graphs": {
+        "agent": "./agente_rag.py:agent_rag"
+    },
+    "env": ".env"
+}
+```
+
+Execute com `langgraph dev` e acesse `http://127.0.0.1:2024/docs` para testar pela UI Swagger (o Studio remoto pode falhar por CORS).
 
 ## Conteúdo do curso
 
@@ -490,6 +516,69 @@ Novidades em relação ao `exemplo_rag.ipynb`:
 
 **Como o notebook se comporta em execuções repetidas:** se `chroma_db/` já existe, ele apenas **carrega** a base com `Chroma(persist_directory=...)` — não re-embedda os 972 chunks de novo. O PDF de 24 MB em `arquivos/` e o vector store em `chroma_db/` ficam fora do controle de versão.
 
+### Agente RAG (`agente_rag.py`)
+
+O passo seguinte une os dois mundos: o **RAG** vira uma **ferramenta dentro de um agente**. Em vez de um notebook isolado, o `agente_rag.py` expõe a busca no documento como uma `@tool` que o modelo chama quando necessário:
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain.agents import create_agent
+
+load_dotenv()
+
+# 1. Carregamento e chunking do PDF (executado uma vez na importação)
+documents = PyPDFLoader("arquivos/Flutter_for_Beginners_by_Alessandro_Biessek_(z-lib.org).pdf").load()
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+docs = text_splitter.split_documents(documents)
+
+# 2. Vector store persistente (cria se não existir, carrega se existir)
+if os.path.exists("./chroma_db"):
+    vector_store = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+else:
+    vector_store = Chroma.from_documents(docs, embeddings, persist_directory="./chroma_db")
+
+# 3. A busca vira uma ferramenta do agente
+@tool(response_format="content_and_artifact")
+def buscar_no_documento(pergunta: str):
+    """Essa ferramenta busca informações no documento carregado..."""
+    retrieved_docs = vector_store.similarity_search(pergunta, k=2)
+    serialized = "\n\n".join(
+        f"Fonte: {doc.metadata}\n Conteudo: {doc.page_content}"
+        for doc in retrieved_docs
+    )
+    return serialized, retrieved_docs
+
+# 4. Agente com o Gemini que decide quando usar a ferramenta
+agent_rag = create_agent(
+    model=llm,
+    tools=[buscar_no_documento],
+    system_prompt="Você é um assistente especializado em Flutter..."
+)
+```
+
+**Novidades em relação aos módulos anteriores:**
+
+| Conceito | O que muda |
+|---|---|
+| `@tool(response_format="content_and_artifact")` | A tool retorna **dois valores**: o texto formatado (para o modelo ler) e os objetos `Document` brutos (para o sistema processar) |
+| Vector store como **closure** | O `vector_store` é criado no módulo e capturado pela tool — não precisa recriar a cada chamada |
+| Carga sob demanda | Se o `chroma_db/` existe, carrega; senão, cria do zero. Reusa o mesmo banco do `rag_pdf.ipynb` |
+| `create_agent` do `langchain.agents` | API atual (não confundir com `create_react_agent` do `langgraph.prebuilt`, que é deprecado) |
+| Exposição via `langgraph.json` | O grafo é servido pelo `langgraph dev` para testes via API REST |
+
+**Lições aprendidas no desenvolvimento:**
+
+1. **`load_dotenv()` antes de qualquer coisa** — sem ele, as chaves da OpenAI (embeddings) e Google (Gemini) não são carregadas e o import do módulo falha.
+2. **Modelo `gemini-3.5-flash-lite` não existe** — erro comum de digitação. Os modelos válidos do Gemini são `gemini-1.5-flash`, `gemini-2.0-flash`, etc.
+3. **CORS bloqueia o LangGraph Studio remoto** — o Studio em `https://smith.langchain.com` não consegue chamar `http://127.0.0.1`. Use a UI Swagger em `http://127.0.0.1:2024/docs` para testar.
+4. **Tool sem fallback para busca vazia** — se o Chroma não achar documentos similares, a tool retorna string vazia. Melhoria futura: adicionar busca web (Tavily) como fallback.
+5. **O PDF precisa existir** — o `PyPDFLoader` com path hardcoded quebra se o arquivo não estiver em `arquivos/`.
+
 ### Modelos são stateless (sem memória)
 
 Demonstração feita rodando o `agent.py` em modo de conversa:
@@ -646,10 +735,11 @@ Langchain-project/
 ├── agent.py              # Agente com LangGraph (Gemini + Tavily + memória SQLite)
 ├── agente_banco.py       # v1: agente de banco com SQLDatabaseToolkit (referência didática)
 ├── agente_banco_v2.py    # v2: agente de banco com tools nativas (@tool + sqlite3, sem langchain-community)
+├── agente_rag.py          # Agente RAG: PDF do Flutter + Chroma + busca como ferramenta (@tool)
 ├── arquivos/             # Documentos de entrada do RAG (ex.: PDF do Flutter, ignorado)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
 ├── chroma_db/            # Vector store persistente do RAG completo (runtime, ignorado)
-├── langgraph.json        # Configuração do grafo para a CLI (aponta para `agente_banco_v2.py:agente_banco`)
+├── langgraph.json        # Configuração do grafo para a CLI (aponta para `./agente_rag.py:agent_rag`)
 ├── loja.sqlite           # Banco da loja fictícia consultado pelo agente (runtime, ignorado)
 ├── main.ipynb            # Notebook principal do curso
 ├── main.py               # Entry point simples do projeto
@@ -708,6 +798,7 @@ uv add nome-do-pacote
 - [x] Resumo de contexto: `SummarizationMiddleware` (`trigger` + `keep`)
 - [x] RAG: embeddings + `InMemoryVectorStore` + retriever (`exemplo_rag.ipynb`)
 - [x] RAG completo com geração: PDF + Chroma persistente + resposta com Gemini (`rag_pdf.ipynb`)
+- [x] Agente RAG: RAG como ferramenta de agente com `create_agent` (`agente_rag.py`)
 - [ ] RAG com busca web (Tavily) para complementar o contexto quando a base não responde
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] TBD...
