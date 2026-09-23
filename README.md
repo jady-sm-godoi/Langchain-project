@@ -15,6 +15,8 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Agente com banco de dados (tools nativas)](#agente-com-banco-de-dados-tools-nativas)
 - [RAG (Recuperação de Informação)](#rag-recuperação-de-informação)
 - [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
+- [Middleware e Guardrails no ciclo de vida do agente](#middleware-e-guardrails-no-ciclo-de-vida-do-agente)
+  - [Human in the loop (`HumanInTheLoopMiddleware`)](#human-in-the-loop-humanintheloopmiddleware)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Dependências](#dependências)
@@ -706,6 +708,238 @@ SummarizationMiddleware(
 )
 ```
 
+### Middleware e Guardrails no ciclo de vida do agente
+
+O `SummarizationMiddleware` foi o primeiro **middleware** que encontramos, mas ele é apenas um caso de uso de um conceito muito maior. **Middleware** é todo **código que roda no meio do caminho do agente** — entre os passos do loop — para **observar**, **modificar** ou **decidir** sobre o que está acontecendo.
+
+Um agente `create_agent` não é só "modelo + ferramentas". Ele é um **grafo** (LangGraph) com pontos de interceptação bem definidos. A imagem abaixo (em `assets_didatico/middleware_langchain.png`) mostra esse ciclo de vida:
+
+![Ciclo de vida do agente com middleware](assets_didatico/middleware_langchain.png)
+
+**O fluxo do agente (com o loop do modelo):**
+
+```
+Mensagem do usuário
+   │
+   ▼
+before_agent        (roda 1x, antes de tudo)
+   │
+   ▼
+┌────────────────── LOOP DO MODELO (repete enquanto o agente chamar uma tool) ──────────────────┐
+│   before_model   →   Chamada ao modelo   →   after_model   →   Tool (wrap_tool_call)        │
+│        ▲                                                                      │              │
+│        └────────────────────── se chamou uma tool, volta ao before_model ─────┘              │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+   │
+   ▼
+after_agent         (roda 1x, com a resposta)
+   │
+   ▼
+Resposta final
+```
+
+#### Os hooks (pontos de interceptação)
+
+Cada etapa do ciclo de vida é um **hook** que um middleware pode "ganchar". A tabela resume cada um:
+
+| Hook | Quando roda | Estilo | Exemplo de uso |
+| --- | --- | --- | --- |
+| `before_agent` | **1x por mensagem** do usuário, antes de tudo | node | carregar dados do usuário; guardrail que identifica CPF e anonimiza (LGPD); guardrail para linguagem imprópria |
+| `before_model` | **antes de cada chamada** ao modelo (dentro do loop) | node | cortar histórico; medir contexto; resumir o que já foi consumido |
+| `after_model` | **depois de cada resposta** do modelo | node | conferir formato; checagem de segurança da saída |
+| `wrap_model_call` | **envolve** a chamada ao modelo | wrap | trocar de modelo caso falhe e tentar de novo (fallback) |
+| `wrap_tool_call` | **envolve** a execução de uma tool | wrap | bloquear ou registrar a execução; devolver erro de forma amigável ao modelo |
+| `after_agent` | **1x**, com a resposta final | node | salvar a conversa; logar o resultado |
+
+#### Os dois estilos: node vs wrap
+
+O diagrama distingue dois comportamentos possíveis do middleware:
+
+- **Node-style** (hooks `before_agent`, `before_model`, `after_model`, `after_agent`): podemos **olhar e mexer nos dados** que estão passando. O gancho é **acionado sempre** no fluxo. Exemplos: contar tokens, resumir contexto, salvar logs.
+- **Wrap-style** (hooks `wrap_model_call`, `wrap_tool_call`): **decidimos se a chamada acontece** — e isso só ocorre mediante uma **situação específica** (erro, bloqueio, etc.). Envolvemos a execução com um `handler` que chamamos 0, 1 ou N vezes. Exemplos: trocar de modelo, tentar novamente, bloquear.
+
+> A distinção prática: **node** é um *ponto de passagem* (sempre executado, pode alterar o estado); **wrap** é um *interceptador de decisão* (controla se/quantas vezes a chamada real acontece).
+
+#### Middlewares prontos
+
+O pacote `langchain.agents.middleware` traz vários middlewares prontos. Os principais:
+
+| Middleware | Papel |
+| --- | --- |
+| `PIIMiddleware` | Detecta e trata **dados pessoais** (LGPD): email, CPF, cartão, IP, URL, etc. |
+| `ModelFallbackMiddleware` | Tenta **modelos reserva** em sequência se o principal falhar (wrap_model_call) |
+| `ModelRetryMiddleware` | **Tenta de novo** a chamada ao modelo em caso de erro temporário |
+| `ToolErrorMiddleware` | Converte erros de tools em `ToolMessage` amigável ao modelo |
+| `ToolRetryMiddleware` | Reexecuta a tool se ela falhar/retornar erro |
+| `ToolCallLimitMiddleware` | Limita o **número de chamadas de tool** por execução |
+| `ModelCallLimitMiddleware` | Limita o **número de chamadas ao modelo** por execução |
+| `SummarizationMiddleware` | **Resume o histórico** antigo para não estourar a janela de contexto |
+| `HumanInTheLoopMiddleware` | **Pausa** o agente para aprovação humana (checkpoint/retomada) |
+| `ShellToolMiddleware` | Aplica **política de execução** a tools de shell (Docker/host/sandbox) |
+| `TodoListMiddleware` | Mantém uma **lista de tarefas** que o agente atualiza durante a execução |
+| `ContextEditingMiddleware` | **Edita o contexto** (limpa usos de tool antigos, injeta trechos) |
+
+#### Guardrails com `PIIMiddleware` (LGPD)
+
+**Guardrail** é um middleware voltado à **segurança/conformidade**: impede que o agente vaze ou processe dados sensíveis indevidamente. O `PIIMiddleware` é o exemplo central:
+
+```python
+from langchain.agents.middleware import PIIMiddleware
+from langchain.agents import create_agent
+
+CPF = r"\d{3}\.\d{3}\.\d{3}-\d{2}"
+
+agente = create_agent(
+    model=MODEL,
+    tools=[abrir_chamado],
+    middleware=[
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        PIIMiddleware("cpf", detector=CPF, strategy="mask", apply_to_input=True),
+    ],
+)
+```
+
+**Assinatura:** `PIIMiddleware(pii_type, *, strategy, detector, apply_to_input, apply_to_output, apply_to_tool_results)`.
+
+| Parâmetro | Papel |
+| --- | --- |
+| `pii_type` | Tipo de PII: `email`, `credit_card`, `ip`, `mac_address`, `url` (built-in) ou um **nome customizado** |
+| `detector` | Detector customizado: uma **regex** (string) ou uma função que devolve matches. Se `None`, usa o detector built-in do tipo |
+| `strategy` | Como tratar o PII: `block` (lança erro), `redact` (substitui por `[REDACTED_TIPO]`), `mask` (mostra só os últimos caracteres), `hash` (hash determinístico) |
+| `apply_to_input` | Checa as **mensagens do usuário** antes da chamada ao modelo |
+| `apply_to_output` | Checa as **respostas do modelo** após a chamada |
+| `apply_to_tool_results` | Checa os **resultados das tools** após a execução |
+
+> **Nota didática (caso real):** a regex do CPF **não pode** ter âncoras `^` e `$`. O `PIIMiddleware` aplica o `detector` sobre o **texto completo** da mensagem. Com `^...$` o padrão só casa se a **string inteira** for um CPF; como a mensagem é "Meu email é... e meu CPF é 050.154.759-74...", o regex não encontra nada e **o CPF não é mascarado**. Use `r"\d{3}\.\d{3}\.\d{3}-\d{2}"` (sem âncoras) para buscar em substring. Esse foi o erro real corrigido no `guardrail_exemplo.py`.
+
+**Os três scripts de exemplo:**
+
+| Arquivo | Demonstra |
+| --- | --- |
+| `guardrail_exemplo.py` | `PIIMiddleware` com **email (redact)** e **CPF (mask)** — guardrail de LGPD sobre a entrada |
+| `middleware_example.py` | `ModelFallbackMiddleware` — **troca de modelo** em caso de falha (estilo *wrap* sobre a chamada ao modelo) |
+| `aula_middlewares.py` | Agente base com tools próprias (`dobro`, `triplo`) — o ponto de partida antes dos middlewares |
+
+#### Como configurar
+
+Basta passar a lista de middlewares no `create_agent`:
+
+```python
+agente = create_agent(
+    model=MODEL,
+    tools=[...],
+    middleware=[...],   # lista de middlewares (prontos ou customizados)
+)
+```
+
+A **ordem importa**: os middlewares compõem em camadas, com o **primeiro da lista como camada mais externa**. Em hooks de *wrap*, o primeiro definido envolve os demais.
+
+### Human in the loop (`HumanInTheLoopMiddleware`)
+
+O `SummaryMiddleware` resolvia o *contexto*; o `PIIMiddleware` resolvia a *privacidade*. O `HumanInTheLoopMiddleware` resolve um terceiro problema: **ações destrutivas não podem rodar sem uma checagem humana**. O exemplo completo está em `human_in_the_loop_exemplo.py`.
+
+**O cenário:** o agente tem duas tools — `consultar_client` (só leitura) e `cancelar_plano` (**cancela o plano do cliente**). Cancelar é uma ação **irreversível**; não queremos que o modelo execute sozinho. O middleware **pausa o agente** antes de executá-la, pede a um humano `[a]provar` ou `[r]ejeitar` e só então retoma.
+
+**Configuração:** o parâmetro `interrupt_on` mapeia **nome da tool → política de aprovação**:
+
+```python
+HumanInTheLoopMiddleware(
+    interrupt_on={
+        # Tool destrutiva: exige aprovação. O humano escolhe entre approve e reject.
+        "cancelar_plano": {"allowed_decisions": ["approve", "reject"]},
+        # Tool de leitura: False = auto-aprovada, não pausa o agente.
+        "consultar_client": False,
+    }
+)
+```
+
+| Valor de `interrupt_on[name]` | Comportamento |
+| --- | --- |
+| `True` | Pausa e permite **todas as decisões**: `approve`, `edit`, `reject`, `respond` |
+| `False` | **Auto-aprova** — a tool roda sem parar o agente |
+| `{"allowed_decisions": [...]}` | Pausa e permite **apenas as decisões listadas** (ex.: só `approve`/`reject`) |
+| *(tool sem entrada)* | **Auto-aprovada por padrão** — só entra no dicionário o que precisa de check |
+
+**Como funciona (o ciclo de vida da aprovação):**
+
+```
+Usuário: "Cancela o plano do cliente 4471"
+   │
+   ▼
+┌─ LOOP DO MODELO ───────────────────────────────────────────────┐
+│  before_model → modelo → after_model ─(gera tool_call)──┐     │
+│                                                       │     │
+│   after_model (HumanInTheLoop) → interrupt() ⇢ PAUSA  │     │
+└───────────────────────────────────────────────────────┼─────┘
+                                                        │
+                              o processo para AGUARDANDO UM HUMANO
+                                                        │
+   humano digita [a]provar / [r]ejeitar                 │
+                                                        ▼
+              Command(resume={"decisions": [{"type": "approve"}]})
+                                                        │
+   approve → executa `cancelar_plano` ◀────────────────┘
+   reject  → NÃO executa; devolve ToolMessage de erro ao modelo
+```
+
+**Como o middleware intercepta:** ele se conecta ao hook **`after_model`**. Quando o modelo gera uma `AIMessage` com `tool_calls`, o middleware verifica se alguma tool está em `interrupt_on`. Se estiver, ele chama o **`interrupt()`** do LangGraph — que **pausa o grafo** e salva o estado no **checkpointer**. O `invoke` retorna **antes da resposta final**, com o campo `interrupts` preenchido.
+
+**As decisões possíveis** (campo `type` de cada decisão):
+
+| Decisão | O que faz |
+| --- | --- |
+| `approve` | **Aprova** e executa a tool normalmente |
+| `reject` | **Rejeita** e NÃO executa — cria uma `ToolMessage` de erro, dizendo ao modelo para não tentar de novo |
+| `edit` | Aprova com **edição**: o humano pode mudar os argumentos antes de executar |
+| `respond` | O humano **responde no lugar da tool** — pulando a execução e injetando a resposta dele |
+
+**Como retomar:** enviamos a decisão com `Command(resume=...)`:
+
+```python
+r = agente.invoke(
+    Command(resume={"decisions": [{"type": "approve"}]}),
+    config=config,
+    version="v2",
+)
+```
+
+- `resume={"decisions": [...]}` **"desbloqueia"** o `interrupt()` que fez a pausa — a chave `decisions` precisa casar com o que o middleware interceptou.
+- **`checkpointer` é obrigatório**: é o checkpointer que guarda o estado pausado (mensagens + tool_calls pendentes) e permite retomar de onde parou. Sem ele, não há como continuar.
+- **`thread_id`** identifica a conversa; o estado pausado fica isolado por thread.
+
+**A API moderna de retorno (`version="v2"`):** ao passar `version="v2"`, o `invoke` retorna um `GraphOutput` em vez de um dict simples. Isso muda o acesso ao resultado:
+
+```python
+# DEPRECADO (V1.1 → V3.0): usar `result[key]`
+print(r["messages"][-1].content)       # ❌ aviso: LangGraphDeprecatedSinceV11
+
+# NOVO: acessar os campos do GraphOutput
+print(r.value["messages"][-1].content)         # ✅ valor da saída (resposta final)
+while r.interrupts: ...                        # ✅ lista de interrupts pendentes
+```
+
+| Acesso | Significado |
+| --- | --- |
+| `result.value` | O **valor de saída** (estado final) — use para chegar às `messages` |
+| `result.interrupts` | Lista de **interrupts pendentes** — se não-vazia, o agente está pausado |
+
+> **Nota didática (lição real):** a chave em `interrupt_on` precisa **casar exatamente** com o nome da tool. No exemplo, a tool se chama `consultar_client`, mas a config original usava `"consultar_cliente"` — como não batia, aquela entrada **nunca era aplicada** (e o comportamento de auto-aprovar "não funcionava" como esperado). O mesmo vale para o modelo: `gemini-2.0-flash` foi retirado de circulação e a API hoje sugere `gemini-3.6-flash`.
+
+**Rodando o exemplo** (o modelo atual é o Gemini `gemini-3.6-flash`):
+
+```bash
+uv run human_in_the_loop_exemplo.py
+```
+
+Ao pedir o cancelamento, o agente pausa e aguarda no terminal:
+
+```
+agente pausado...
+[a]provar  [r]ejeitar > a
+>>>> Cancelou o plano do cliente 4471
+O plano do cliente 4471 foi cancelado com sucesso.
+```
+
 ## Ferramentas extras — LangGraph Studio/CLI
 
 Para visualizar e depurar grafos de forma visual, o ecossistema LangChain oferece o **LangGraph Studio**, cujo backend local é gerenciado pela CLI oficial do LangGraph.
@@ -737,6 +971,11 @@ Langchain-project/
 ├── agente_banco_v2.py    # v2: agente de banco com tools nativas (@tool + sqlite3, sem langchain-community)
 ├── agente_rag.py          # Agente RAG: PDF do Flutter + Chroma + busca como ferramenta (@tool)
 ├── arquivos/             # Documentos de entrada do RAG (ex.: PDF do Flutter, ignorado)
+├── assets_didatico/      # Imagens didáticas do curso (ex.: middleware_langchain.png)
+├── aula_middlewares.py   # Agente base com tools próprias (dobro/triplo) — antes dos middlewares
+├── guardrail_exemplo.py  # Guardrail LGPD: PIIMiddleware (email redact + CPF mask)
+├── human_in_the_loop_exemplo.py  # Human in the loop: aprovação humana antes de tool destrutiva
+├── middleware_example.py # Middleware de fallback de modelo (ModelFallbackMiddleware)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
 ├── chroma_db/            # Vector store persistente do RAG completo (runtime, ignorado)
 ├── langgraph.json        # Configuração do grafo para a CLI (aponta para `./agente_rag.py:agent_rag`)
@@ -796,6 +1035,10 @@ uv add nome-do-pacote
 - [x] Memória com checkpoints: `InMemorySaver` + `thread_id`
 - [x] Persistência real da memória: `SqliteSaver` (arquivo `checkpoints.db`)
 - [x] Resumo de contexto: `SummarizationMiddleware` (`trigger` + `keep`)
+- [x] Middleware e guardrails: ciclo de vida do agente (hooks before/after + wrap)
+- [x] Guardrail LGPD: `PIIMiddleware` (email redact + CPF mask) — `guardrail_exemplo.py`
+- [x] Fallback de modelo: `ModelFallbackMiddleware` — `middleware_example.py`
+- [x] Human in the loop: `HumanInTheLoopMiddleware` (aprovação humana via interrupt/resume) — `human_in_the_loop_exemplo.py`
 - [x] RAG: embeddings + `InMemoryVectorStore` + retriever (`exemplo_rag.ipynb`)
 - [x] RAG completo com geração: PDF + Chroma persistente + resposta com Gemini (`rag_pdf.ipynb`)
 - [x] Agente RAG: RAG como ferramenta de agente com `create_agent` (`agente_rag.py`)
@@ -806,6 +1049,7 @@ uv add nome-do-pacote
 ## Referências
 
 - [Documentação do LangChain (Python)](https://python.langchain.com/docs/introduction/)
+- [Middleware (LangChain Agents)](https://docs.langchain.com/oss/python/langchain/middleware)
 - [LangGraph CLI](https://reference.langchain.com/python/langgraph-cli)
 - [uv — gerenciador de projetos](https://docs.astral.sh/uv/)
 - [Google AI Studio (chave da API Gemini)](https://aistudio.google.com/apikey)
