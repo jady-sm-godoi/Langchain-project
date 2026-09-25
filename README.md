@@ -940,6 +940,117 @@ agente pausado...
 O plano do cliente 4471 foi cancelado com sucesso.
 ```
 
+### MCP — Model Context Protocol (`mcp_exemplo.py`)
+
+**MCP (Model Context Protocol)** é um protocolo aberto criado pela Anthropic que padroniza a comunicação entre LLMs e **ferramentas externas**. Em vez de cada framework criar sua própria interface de tools, o MCP define um contrato comum — um servidor MCP expõe ferramentas que **qualquer cliente MCP compatível** pode consumir, independente de linguagem ou ecossistema.
+
+O projeto `langchain-mcp-adapters` (mantido oficialmente pela LangChain) conecta esses dois mundos: ele inicia servidores MCP, descobre as ferramentas que eles expõem e as converte em **tools nativas do LangChain** que podem ser usadas com `create_agent`.
+
+#### Por que MCP?
+
+Antes do MCP, cada integração de ferramenta era **customizada**: um pacote para busca web, outro para banco de dados, outro para API externa. Com MCP, **qualquer servidor que implemente o protocolo** pode ser consumido pelo mesmo `MultiServerMCPClient` — existem milhares de servidores MCP prontos (DuckDuckGo, GitHub, Notion, documentação, banco de dados, arquivos, etc.).
+
+#### Transportes MCP: stdio vs HTTP
+
+O protocolo MCP define **dois transportes principais** para comunicação entre cliente e servidor:
+
+| Transporte | Quando usar | Como funciona |
+|---|---|---|
+| **stdio** | Servidor roda como **processo local** (CLI, pacote Python/Node.js) | O cliente inicia o servidor como subprocesso e troca mensagens JSON via **stdin/stdout**. A configuração leva `command` + `args` (ex.: `uvx duckduckgo-mcp-server`). |
+| **http** (Streamable HTTP) | Servidor **remoto** (hospedado em um endpoint HTTP) | O cliente faz requisições HTTP ao endpoint do servidor. O "Streamable" significa que respostas longas podem ser transmitidas em chunks (streaming). A configuração leva `url` (ex.: `https://mcp.context7.com/mcp`). |
+
+O transporte **stdio** não precisa de rede (tudo é local), mas o servidor precisa estar instalado/executável na máquina. O transporte **http** não consome recursos locais, mas depende de rede e latência.
+
+#### O código — `mcp_exemplo.py`
+
+```python
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from dotenv import load_dotenv
+
+load_dotenv()
+model = init_chat_model("gemini-3.6-flash", model_provider="google_genai")
+
+client = MultiServerMCPClient({
+    "busca": {
+        "transport": "stdio",          # processo local
+        "command": "uvx",               # executa sem instalar
+        "args": ["duckduckgo-mcp-server"],
+    },
+    "docs": {
+        "transport": "http",            # servidor remoto
+        "url": "https://mcp.context7.com/mcp",
+    },
+})
+
+tools = asyncio.run(client.get_tools())
+agente = create_agent(model=model, tools=tools)
+```
+
+**Passo a passo:**
+
+1. **`MultiServerMCPClient({...})`** — recebe um dicionário onde cada chave é o **nome do servidor** (livre) e o valor são as configurações de conexão. Ele gerencia o ciclo de vida de todos os servidores internamente.
+2. **Transporte stdio (servidor `busca`)** — define `command: "uvx"` e `args: ["duckduckgo-mcp-server"]`. O `uvx` é uma ferramenta do **uv** que baixa e executa pacotes Python temporariamente, sem instalá-los no ambiente. O servidor DuckDuckGo MCP é iniciado como subprocesso e se comunica via stdin/stdout.
+3. **Transporte http (servidor `docs`)** — define `url: "https://mcp.context7.com/mcp"`. O `context7.com/mcp` é um servidor MCP público que expõe ferramentas de documentação. A comunicação é via Streamable HTTP — o cliente envia requisições HTTP e recebe respostas estruturadas.
+4. **`client.get_tools()`** — descobre **todas as ferramentas** de todos os servidores conectados e as converte em tools LangChain. O retorno é uma lista que pode ser passada diretamente ao `create_agent`.
+5. **`create_agent(model, tools)`** — monta o agente LangChain. O modelo Gemini agora tem acesso às ferramentas MCP dos dois servidores: busca web (DuckDuckGo) + documentação (Context7).
+
+**Como testar (blocos comentados no final do arquivo):**
+
+- **Teste 1 — listar ferramentas:** descomente o primeiro bloco `async def main()` para ver quantas e quais ferramentas cada servidor expõe.
+- **Teste 2 — executar o agente:** descomente o segundo bloco para rodar o agente com uma pergunta. A resposta vem em blocos (`type: "text"`, `type: "extras"`, etc.) — o código filtra pelo bloco de texto com `next(b["text"] for b in r["messages"][-1].content if b["type"] == "text")`.
+
+**Observação sobre a resposta do agente:** o `r["messages"][-1]` é um objeto `AIMessage`. O atributo `.content` pode ser uma **string** (resposta textual simples) ou uma **lista de dicionários** (resposta multimídia: texto + imagens + extras). Quando a resposta vem como lista, acessar `["content"]` diretamente não funciona — é preciso iterar pelos blocos e selecionar o `type` desejado.
+
+#### Fluxo completo da arquitetura
+
+```
+Usuário: "Como fazer tofu?"
+    │
+    ▼
+create_agent (Gemini)
+    │
+    ├── modelo decide: "preciso buscar na web"
+    │       │
+    │       ▼
+    │   Tool LangChain (convertida do MCP)
+    │       │
+    │       ▼
+    │   MultiServerMCPClient
+    │       │
+    │       ├── servidor "busca" (stdio / DuckDuckGo)
+    │       │     └── resultado da busca (texto)
+    │       │
+    │       └── (se precisasse de docs, chamaria o servidor "docs")
+    │
+    ▼
+Modelo compila a resposta com os dados da busca
+    │
+    ▼
+Resposta final ao usuário
+```
+
+O modelo Gemini não sabe (nem precisa saber) que as ferramentas vieram de servidores MCP. Para o `create_agent`, são **tools LangChain comuns** — o MCP é um detalhe de implementação escondido pelo `MultiServerMCPClient`.
+
+#### Para executar
+
+```bash
+uv run mcp_exemplo.py
+```
+
+Lembre-se de descomentar apenas **um** bloco `main()` por execução — eles são mutuamente exclusivos.
+
+### Dependências adicionadas
+
+| Pacote | Papel |
+|---|---|
+| `langchain-mcp-adapters` | Ponte oficial LangChain ↔ MCP: conecta servidores MCP e converte ferramentas para tools nativas |
+| `mcp` | SDK do protocolo MCP (gerencia transportes, sessões, mensagens JSON-RPC) |
+
+---
+
 ## Ferramentas extras — LangGraph Studio/CLI
 
 Para visualizar e depurar grafos de forma visual, o ecossistema LangChain oferece o **LangGraph Studio**, cujo backend local é gerenciado pela CLI oficial do LangGraph.
@@ -975,6 +1086,7 @@ Langchain-project/
 ├── aula_middlewares.py   # Agente base com tools próprias (dobro/triplo) — antes dos middlewares
 ├── guardrail_exemplo.py  # Guardrail LGPD: PIIMiddleware (email redact + CPF mask)
 ├── human_in_the_loop_exemplo.py  # Human in the loop: aprovação humana antes de tool destrutiva
+├── mcp_exemplo.py           # MCP: integração com servidores MCP via stdio e http
 ├── middleware_example.py # Middleware de fallback de modelo (ModelFallbackMiddleware)
 ├── checkpoints.db        # Banco da memória do agente (runtime, ignorado)
 ├── chroma_db/            # Vector store persistente do RAG completo (runtime, ignorado)
@@ -1010,7 +1122,9 @@ Definidas em `pyproject.toml`:
 | `langgraph` | Framework de grafos/estados para agentes |
 | `langgraph-checkpoint-sqlite` | Checkpointer persistente em SQLite (fornece o `SqliteSaver`) |
 | `langgraph-cli[inmem]` | CLI do LangGraph com runtime em memória (sem Docker) |
+| `langchain-mcp-adapters` | Ponte oficial LangChain ↔ MCP: conecta servidores MCP e converte ferramentas para tools nativas |
 | `langchain-tavily` | Tool de busca web (Tavily) usada pelo agente |
+| `mcp` | SDK do protocolo MCP (gerencia transportes, sessões, mensagens JSON-RPC) |
 | `pypdf` | Leitor de PDFs, usado pelo `PyPDFLoader` do RAG completo |
 | `dotenv` | Carrega variáveis de ambiente do arquivo `.env` |
 
@@ -1042,6 +1156,7 @@ uv add nome-do-pacote
 - [x] RAG: embeddings + `InMemoryVectorStore` + retriever (`exemplo_rag.ipynb`)
 - [x] RAG completo com geração: PDF + Chroma persistente + resposta com Gemini (`rag_pdf.ipynb`)
 - [x] Agente RAG: RAG como ferramenta de agente com `create_agent` (`agente_rag.py`)
+- [x] MCP (Model Context Protocol): servidores via stdio e http com `MultiServerMCPClient` (`mcp_exemplo.py`)
 - [ ] RAG com busca web (Tavily) para complementar o contexto quando a base não responde
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] TBD...
