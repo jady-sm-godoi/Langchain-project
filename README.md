@@ -17,6 +17,8 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 - [Gerenciando o contexto com SummarizationMiddleware](#gerenciando-o-contexto-com-summarizationmiddleware)
 - [Middleware e Guardrails no ciclo de vida do agente](#middleware-e-guardrails-no-ciclo-de-vida-do-agente)
   - [Human in the loop (`HumanInTheLoopMiddleware`)](#human-in-the-loop-humanintheloopmiddleware)
+- [MCP — Model Context Protocol](#mcp--model-context-protocol)
+- [DeepAgents — Agente coordenador com subagentes](#deepagents--agente-coordenador-com-subagentes)
 - [Ferramentas extras — LangGraph Studio/CLI](#ferramentas-extras--langgraph-studiocli)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Dependências](#dependências)
@@ -27,7 +29,7 @@ Este README é **didático** e será **aprimorado conforme o curso evolui** — 
 
 **LangChain** é um framework para construir aplicações com LLMs. Em vez de "chamar a API do modelo" direto, você monta **cadeias de componentes** (prompts, modelos, parsers, ferramentas) que se conectam entre si.
 
-O projeto hoje demonstra **sete** conceitos centrais do LangChain:
+O projeto hoje demonstra **oito** conceitos centrais do LangChain:
 
 1. **Pipeline (cadeia)** — uma entrada de texto passa por etapas encadeadas até gerar uma resposta formatada, tudo conectado com o operador `|`:
    ```
@@ -39,6 +41,7 @@ O projeto hoje demonstra **sete** conceitos centrais do LangChain:
 5. **RAG (recuperação de informação)** — o notebook `exemplo_rag.ipynb` vetoriza documentos com embeddings, guarda-os num vector store e recupera os trechos mais relevantes por **similaridade semântica** em resposta a uma pergunta.
 6. **RAG completo com PDF** — o notebook `rag_pdf.ipynb` leva o RAG até o fim: carrega um livro em PDF, divide em chunks, vetoriza com embeddings, persiste num **vector store Chroma** e **gera a resposta final com o Gemini** usando apenas o contexto recuperado.
 7. **Agente RAG (`agente_rag.py`)** — unifica o RAG e o agente: o PDF é carregado, chunkado e vetorizado no Chroma, e a busca no documento vira uma **ferramenta do agente**. O modelo decide quando consultar o documento para responder perguntas sobre Flutter.
+8. **DeepAgents (`deep_agents_exemplo.py`)** — um **agente coordenador** que gerencia subagentes especializados (Pesquisador e Escritor) para produzir artigos técnicos. Combina MCP (busca web) com `TodoListMiddleware` para controle de fluxo.
 
 ## Pré-requisitos
 
@@ -1049,6 +1052,153 @@ Lembre-se de descomentar apenas **um** bloco `main()` por execução — eles s�
 | `langchain-mcp-adapters` | Ponte oficial LangChain ↔ MCP: conecta servidores MCP e converte ferramentas para tools nativas |
 | `mcp` | SDK do protocolo MCP (gerencia transportes, sessões, mensagens JSON-RPC) |
 
+### DeepAgents — Agente coordenador com subagentes (`deep_agents_exemplo.py`)
+
+**DeepAgents** é uma extensão do LangChain que permite criar **agentes coordenadores** capazes de delegar tarefas a **subagentes especializados**. Diferente de um agente comum que chama ferramentas, o agente coordenador gerencia **outros agentes** como se fossem ferramentas — cada subagente tem seu próprio modelo, system prompt e responsabilidade.
+
+O pacote `deepagents` estende o `create_agent` com a função `create_deep_agent`, que aceita o parâmetro `subagents` — uma lista de dicionários descrevendo cada subagente. Internamente, o `SubAgentMiddleware` transforma cada subagente em uma **tool** que o coordenador pode invocar.
+
+#### Conceitos teóricos
+
+**Agente coordenador vs agente comum:**
+
+| | Agente comum (`create_agent`) | Agente coordenador (`create_deep_agent`) |
+|---|---|---|
+| Ferramentas | Tools simples (API, cálculo, banco) | Tools + **subagentes** (agentes completos) |
+| Delegação | O modelo chama a tool diretamente | O coordenador delega a **outro agente** que executa a tarefa |
+| Especialização | Ferramenta faz uma tarefa específica | Subagente tem seu próprio system prompt e modelo |
+| Complexidade | Baixa/Média | Alta (gerenciamento de múltiplos agentes) |
+
+**O problema que resolve:** em pipelines de geração de conteúdo (artigos, relatórios, análises), uma única LLM raramente é boa em **todas as etapas** — pesquisar, analisar, escrever, revisar. O DeepAgents permite montar uma **equipe de agentes** onde cada um é especialista em uma função, e um coordenador gerencia o fluxo.
+
+**Middlewares envolvidos:**
+
+| Middleware | Papel |
+|---|---|
+| `SubAgentMiddleware` | Transforma cada subagente em uma tool chamável pelo coordenador |
+| `TodoListMiddleware` | Mantém uma **lista de tarefas** que o coordenador atualiza durante a execução — o modelo pode adicionar, concluir e consultar tarefas |
+| `ModelFallbackMiddleware` | (Opcional) Tenta modelos reserva em sequência se o principal falhar |
+
+#### Instalação
+
+```bash
+uv add deepagents
+```
+
+> O `deepagents` já inclui `langchain` e `langchain-core` como dependências.
+
+#### O código — `deep_agents_exemplo.py`
+
+```python
+import asyncio
+
+from deepagents import create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.chat_models import init_chat_model
+from dotenv import load_dotenv
+
+load_dotenv()
+model = init_chat_model("openai:gpt-4o-mini")
+
+# ── System prompts dos papéis ──────────────────────────────────────
+COORDENADOR = """Você é um estrategista de alto nível... gerencia e delega."""
+PESQUISADOR = """Você é um agente especializado em pesquisa... busca na web."""
+ESCRITOR = """Você é um redator técnico... transforma dados em artigo."""
+
+# ── Servidor MCP (DuckDuckGo) ──────────────────────────────────────
+client = MultiServerMCPClient({
+    "busca": {
+        "transport": "http",
+        "url": "http://127.0.0.1:8080/mcp",
+    }
+})
+tools = asyncio.run(client.get_tools())
+
+# ── Agente coordenador com subagentes ──────────────────────────────
+agente = create_deep_agent(
+    model,
+    tools,
+    system_prompt=COORDENADOR,
+    subagents=[
+        {"name": "Pesquisador", "description": "Busca informações técnicas na web", "system_prompt": PESQUISADOR},
+        {"name": "Escritor", "description": "Redige artigos técnicos aprofundados", "system_prompt": ESCRITOR},
+    ],
+    middleware=[TodoListMiddleware()],
+)
+```
+
+**Passo a passo:**
+
+1. **`create_deep_agent(model, tools, system_prompt, subagents, middleware)`** — função principal do pacote `deepagents`. Ela herda todos os parâmetros do `create_agent` clássico e adiciona `subagents` e `middleware` específicos.
+
+2. **`subagents`** — lista de dicionários. Cada subagente precisa de:
+   - `name`: identificador único (o coordenador chama o subagente por este nome)
+   - `description`: descrição funcional — o coordenador lê isso para decidir quando delegar
+   - `system_prompt`: instruções específicas do papel (pesquisar, escrever, revisar etc.)
+
+3. **`TodoListMiddleware`** — permite que o coordenador mantenha uma **lista de tarefas** (to-do list) durante a execução. Ele pode adicionar tarefas ("pesquisar X"), marcá-las como concluídas e delegá-las aos subagentes. A lista persiste na memória do agente e ajuda o coordenador a não perder o controle do fluxo.
+
+4. **Servidor MCP** — o mesmo `MultiServerMCPClient` usado no `mcp_exemplo.py`, rodando o DuckDuckGo MCP em `http://127.0.0.1:8080/mcp`. As tools de busca são expostas ao **coordenador**, que as usa quando precisa de informação externa.
+
+#### Como os subagentes funcionam internamente
+
+```
+Usuário: "Escreva um artigo sobre LangGraph"
+    │
+    ▼
+┌─ COORDENADOR ─────────────────────────────────────────────────┐
+│  Modelo: gpt-4o-mini                                          │
+│  System: "Você é um estrategista... gerencia e delega."       │
+│                                                               │
+│  1. Adiciona tarefa "Pesquisar LangGraph" na to-do list       │
+│  2. Invoca subagente "Pesquisador" ───────────────────────┐  │
+│     ┌─ PESQUISADOR ──────────────────────────────────┐    │  │
+│     │  Busca na web (DuckDuckGo MCP)                 │    │  │
+│     │  Retorna dados estruturados ao coordenador     │    │  │
+│     └────────────────────────────────────────────────┘    │  │
+│  3. Adiciona tarefa "Escrever artigo" na to-do list       │  │
+│  4. Invoca subagente "Escritor" ────────────────────────┐ │  │
+│     ┌─ ESCRITOR ───────────────────────────────────┐    │ │  │
+│     │  Transforma dados em artigo final             │    │ │  │
+│     │  Retorna o artigo completo                    │    │ │  │
+│     └───────────────────────────────────────────────┘    │ │  │
+│  5. Marca tarefas como concluídas                        │ │  │
+│  6. Entrega o artigo ao usuário                          │ │  │
+└──────────────────────────────────────────────────────────┘ │  │
+                                                             ▼  ▼
+                                                     Resposta final
+```
+
+**O que o `TodoListMiddleware` faz:** ele intercepta a chamada ao modelo (`wrap_model_call`) e injeta um **system message dinâmico** com a lista de tarefas atual (pendentes e concluídas). O coordenador pode chamar tools especiais do middleware (`add_todo`, `complete_todo`, `list_todos`) para gerenciar o fluxo.
+
+**Por que usar subagentes em vez de tools comuns:** cada subagente roda seu **próprio loop de raciocínio** — ele não é uma função que executa e devolve, mas sim um **agente completo** que pode planejar, buscar informações e iterar antes de responder. Isso é ideal para tarefas complexas (pesquisar, escrever, analisar) que exigem múltiplos passos.
+
+#### Para executar
+
+1. **Iniciar o servidor MCP** (em outro terminal):
+   ```bash
+   uvx duckduckgo-mcp-server --transport streamable-http --port 8080
+   ```
+
+2. **Rodar via LangGraph Studio** (requer `langgraph.json` apontando para `./deep_agents_exemplo.py:agente`):
+   ```bash
+   langgraph dev
+   ```
+
+3. **Ou executar diretamente** (se houver um bloco `main()` descomentado):
+   ```bash
+   uv run deep_agents_exemplo.py
+   ```
+
+> **Atenção:** o módulo executa `asyncio.run(client.get_tools())` na importação. Se for usado com `langgraph dev`, o servidor MCP precisa estar rodando **antes** de subir o LangGraph.
+
+### Dependências adicionadas
+
+| Pacote | Papel |
+|---|---|
+| `deepagents` | Extensão do LangChain: `create_deep_agent` com subagentes, `TodoListMiddleware` e middlewares especializados |
+
 ---
 
 ## Ferramentas extras — LangGraph Studio/CLI
@@ -1084,6 +1234,7 @@ Langchain-project/
 ├── arquivos/             # Documentos de entrada do RAG (ex.: PDF do Flutter, ignorado)
 ├── assets_didatico/      # Imagens didáticas do curso (ex.: middleware_langchain.png)
 ├── aula_middlewares.py   # Agente base com tools próprias (dobro/triplo) — antes dos middlewares
+├── deep_agents_exemplo.py  # DeepAgents: agente coordenador com subagentes e MCP
 ├── guardrail_exemplo.py  # Guardrail LGPD: PIIMiddleware (email redact + CPF mask)
 ├── human_in_the_loop_exemplo.py  # Human in the loop: aprovação humana antes de tool destrutiva
 ├── mcp_exemplo.py           # MCP: integração com servidores MCP via stdio e http
@@ -1116,6 +1267,7 @@ Definidas em `pyproject.toml`:
 | `langchain-core` | Núcleo: interfaces de prompts, modelos, parsers e `Runnable`s |
 | `langchain-chroma` | Vector store persistente em disco, usado pelo RAG completo (`rag_pdf.ipynb`) |
 | `langchain-community` | Integrações da comunidade. **Aposentado em maio/2026** — mantido no projeto apenas para o `agente_banco.py` (v1) e o `PyPDFLoader` do `rag_pdf.ipynb` |
+| `deepagents` | Extensão do LangChain: `create_deep_agent` com subagentes e middlewares especializados |
 | `langchain-google-genai` | Integração com os modelos Google Gemini |
 | `langchain-groq` | Integração com modelos Groq (provedor alternativo) |
 | `langchain-openai` | Integração com modelos OpenAI — usada pelo RAG para gerar embeddings (`text-embedding-3-large`) |
@@ -1157,6 +1309,7 @@ uv add nome-do-pacote
 - [x] RAG completo com geração: PDF + Chroma persistente + resposta com Gemini (`rag_pdf.ipynb`)
 - [x] Agente RAG: RAG como ferramenta de agente com `create_agent` (`agente_rag.py`)
 - [x] MCP (Model Context Protocol): servidores via stdio e http com `MultiServerMCPClient` (`mcp_exemplo.py`)
+- [x] DeepAgents: agente coordenador com subagentes, MCP e `TodoListMiddleware` (`deep_agents_exemplo.py`)
 - [ ] RAG com busca web (Tavily) para complementar o contexto quando a base não responde
 - [ ] LangGraph Studio (visualização e depuração)
 - [ ] TBD...

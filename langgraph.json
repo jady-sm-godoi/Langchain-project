@@ -3,7 +3,7 @@
         "."
     ],
     "graphs": {
-        "agent": "./agente_rag.py:agent_rag"
+        "agent": "./deep_agents_exemplo.py:agente"
     },
     "env": ".env"
 }
